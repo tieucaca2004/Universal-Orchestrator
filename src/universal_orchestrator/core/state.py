@@ -26,6 +26,11 @@ from universal_orchestrator.core.models import (
     TaskStatus,
 )
 from universal_orchestrator.errors import DuplicateError, NotFoundError
+from universal_orchestrator.execution.adapter import (
+    ExecutionOutcome,
+    ExecutionResult,
+    VerificationStatus,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -67,6 +72,27 @@ CREATE TABLE IF NOT EXISTS routing_decisions (
     decided_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_routing_decisions_task_id ON routing_decisions(task_id);
+
+-- Same reasoning as routing_decisions: its own table, so an execution
+-- result can never corrupt a task's row or history (Milestone 4).
+CREATE TABLE IF NOT EXISTS execution_results (
+    execution_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    exit_code INTEGER,
+    stdout TEXT NOT NULL DEFAULT '',
+    stderr TEXT NOT NULL DEFAULT '',
+    started_at TEXT,
+    ended_at TEXT,
+    duration_seconds REAL,
+    cli_version TEXT,
+    output_format TEXT,
+    structured_output TEXT,
+    structured_output_valid INTEGER,
+    verification_status TEXT,
+    error_classification TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_execution_results_task_id ON execution_results(task_id);
 """
 
 _COLUMNS = (
@@ -196,6 +222,47 @@ class StateManager:
         )
         return [_row_to_routing_decision(row) for row in cursor.fetchall()]
 
+    # -- execution results -----------------------------------------------------
+
+    def save_execution_result(self, result: ExecutionResult) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO execution_results (
+                    execution_id, task_id, outcome, exit_code, stdout, stderr,
+                    started_at, ended_at, duration_seconds, cli_version,
+                    output_format, structured_output, structured_output_valid,
+                    verification_status, error_classification
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    result.execution_id,
+                    result.task_id,
+                    result.outcome.value,
+                    result.exit_code,
+                    result.stdout,
+                    result.stderr,
+                    result.started_at.isoformat() if result.started_at else None,
+                    result.ended_at.isoformat() if result.ended_at else None,
+                    result.duration_seconds,
+                    result.cli_version,
+                    result.output_format,
+                    json.dumps(result.structured_output)
+                    if result.structured_output is not None
+                    else None,
+                    None if result.structured_output_valid is None else int(result.structured_output_valid),
+                    result.verification_status.value if result.verification_status else None,
+                    result.error_classification,
+                ),
+            )
+
+    def get_execution_results(self, task_id: str) -> list[ExecutionResult]:
+        cursor = self._conn.execute(
+            "SELECT * FROM execution_results WHERE task_id = ? ORDER BY started_at",
+            (task_id,),
+        )
+        return [_row_to_execution_result(row) for row in cursor.fetchall()]
+
 
 def _task_to_row(task: Task) -> dict[str, object]:
     return {
@@ -256,4 +323,30 @@ def _row_to_routing_decision(row: sqlite3.Row) -> RoutingDecision:
         rejected=[RejectedCandidate(**entry) for entry in json.loads(row["rejected"])],
         score=row["score"],
         decided_at=datetime.fromisoformat(row["decided_at"]),
+    )
+
+
+def _row_to_execution_result(row: sqlite3.Row) -> ExecutionResult:
+    return ExecutionResult(
+        execution_id=row["execution_id"],
+        task_id=row["task_id"],
+        outcome=ExecutionOutcome(row["outcome"]),
+        exit_code=row["exit_code"],
+        stdout=row["stdout"],
+        stderr=row["stderr"],
+        started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
+        ended_at=datetime.fromisoformat(row["ended_at"]) if row["ended_at"] else None,
+        duration_seconds=row["duration_seconds"],
+        cli_version=row["cli_version"],
+        output_format=row["output_format"],
+        structured_output=json.loads(row["structured_output"])
+        if row["structured_output"] is not None
+        else None,
+        structured_output_valid=None
+        if row["structured_output_valid"] is None
+        else bool(row["structured_output_valid"]),
+        verification_status=VerificationStatus(row["verification_status"])
+        if row["verification_status"]
+        else None,
+        error_classification=row["error_classification"],
     )

@@ -32,7 +32,7 @@ repository.
 
 | # | Component | Module | Status |
 |---|---|---|---|
-| 1 | Orchestration Engine | `core/engine.py` | **Done** (Analyzer → Manager → State, and now → Router; no Dispatcher or adapter wiring) |
+| 1 | Orchestration Engine | `core/engine.py` | **Done** (Analyzer → Manager → Router → Execution Adapter; no Dispatcher) |
 | 1a | Task Analyzer | `analysis/analyzer.py` | **Done** |
 | 1b | Task Manager | `core/task_manager.py`, `core/lifecycle.py` | **Done** |
 | 2 | Project Profile Registry | `registry/projects.py` | **Done** — see [docs/REGISTRIES.md](docs/REGISTRIES.md) |
@@ -42,23 +42,25 @@ repository.
 | 5 | Task Lifecycle + persistent state | `core/models.py`, `core/lifecycle.py`, `core/state.py` (SQLite) | **Done** — see [docs/TASK_LIFECYCLE.md](docs/TASK_LIFECYCLE.md) |
 | 6 | Task Planner interface | `planning/planner.py` | **Done** (interface) |
 | 7 | Dispatcher interface | `planning/dispatcher.py` | **Done** (interface) |
-| 8 | Execution Adapter interface | `execution/adapter.py` | **Done** (interface); concrete adapters in Milestone 5 (per this repo's internal numbering — Milestones 4–5 in the Founder's authoritative roadmap below) |
+| 8 | Execution Adapter interface + Claude Code Adapter | `execution/adapter.py`, `execution/claude_code.py` | **Done** — see [docs/EXECUTION_CLAUDE_CODE.md](docs/EXECUTION_CLAUDE_CODE.md). Dispatcher itself remains unimplemented; a future DeepSeek adapter is not implemented (none installed to verify against). |
+| 8a | Adapter Registry (multi-engine selection) | `execution/registry.py` | **Done** — see [docs/EXECUTION_CLAUDE_CODE.md](docs/EXECUTION_CLAUDE_CODE.md) "Multi-engine architecture" |
 | 9 | Structured logging / audit trail | `audit/logger.py` (logging, done), full audit trail in a later milestone |
 | 10 | Configuration management | `config/settings.py` | **Done** |
 | 11 | Error handling & recovery | `errors.py` | **Done** |
-| 12 | Unit / integration tests | `tests/` | Ongoing; 140/140 passing as of Milestone 3 |
+| 12 | Unit / integration tests | `tests/` | Ongoing; 185/185 passing as of Milestone 4 |
 
 Components marked "Done" are real, tested code. Everything else is either a
-genuine interface (6, 7, 8 — explicitly scoped as interfaces) or an empty,
-clearly-labelled placeholder module naming the milestone that implements it
-(the Approval Gate). Nothing claims to work before it does.
+genuine interface (7 — Dispatcher, explicitly scoped as an interface) or an
+empty, clearly-labelled placeholder module naming the milestone that
+implements it (the Approval Gate). Nothing claims to work before it does.
 
 The Task Manager explicitly does **not** decide which agent or provider
-executes a task — that is the Agent Router's job, implemented this
-milestone. The Router, in turn, only ever *selects*: it reads the
-registries, evaluates eligibility, and returns an explainable
-`RoutingDecision` — it never calls a provider, never starts a Git
-worktree, and never contacts a machine. See [docs/ROUTING.md](docs/ROUTING.md).
+executes a task — that is the Agent Router's job. The Router only ever
+*selects*: it never calls a provider, starts a Git worktree, or contacts
+a machine. `OrchestrationEngine.execute()` is the one place a real
+provider call happens, and only after a `RoutingOutcome.SELECTED`
+decision exists — see [docs/ROUTING.md](docs/ROUTING.md) and
+[docs/EXECUTION_CLAUDE_CODE.md](docs/EXECUTION_CLAUDE_CODE.md).
 
 ## Provider verification policy
 
@@ -72,10 +74,15 @@ a provider or agent while it is unverified — see
 ## Approval boundaries
 
 The engine must route any sensitive action through `approval/gate.py`
-(Milestone 4) before it executes — in particular anything touching
-existing Docker infrastructure, existing project repositories,
+(M6, per the roadmap below) before it executes — in particular anything
+touching existing Docker infrastructure, existing project repositories,
 credentials/secrets, production systems, or the RTX 3070 Desktop. Until
-Milestone 4 lands, no adapter may perform such actions at all.
+M6 lands, the only execution path that exists
+(`OrchestrationEngine.execute()` → `ClaudeCodeAdapter`) enforces its own
+safety boundary directly: zero-write, zero-tool execution only (see
+[docs/EXECUTION_CLAUDE_CODE.md](docs/EXECUTION_CLAUDE_CODE.md)) — not a
+substitute for the real Approval Gate, but a fail-closed default in its
+absence.
 
 ## Roadmap
 
@@ -87,7 +94,7 @@ sequence must not change without Founder approval.
 1. **M1 — Repository Foundation.** **Done.**
 2. **M2 — Task Analyzer, Task Manager, State Manager.** **Done.**
 3. **M3 — Project Registry, Agent Registry, Provider Registry, Agent Router.** **Done.**
-4. **M4 — Claude CLI Adapter and non-interactive execution verification.**
+4. **M4 — Claude CLI Adapter and non-interactive execution verification.** **Done.**
 5. **M5 — Hermes Adapter and execution verification.**
 6. **M6 — Git Worktree, Conflict Manager, Approval Gate and Quality Gate.**
 7. **M7 — Worker Protocol and RTX 3070 integration.**
@@ -146,3 +153,20 @@ audit for how each was found.
    never seeded into production code, and `AgentDescriptor.machine` is a
    logical label chosen by whoever calls `register()`, never a verified
    fact about real hardware.
+5. **Claude CLI has no literal "read-only" permission mode.** Verified
+   against real `claude --help` output (Milestone 4): `--permission-mode`
+   accepts `acceptEdits, auto, bypassPermissions, manual, dontAsk, plan`
+   — none named "read-only". `ClaudeCodeAdapter` implements read-only
+   execution as `--tools ""` (every tool disabled) instead, the one
+   option directly and unambiguously documented. This is more
+   restrictive than a hypothetical "read some things, write nothing"
+   mode would be — Planner/Architect/Reviewer roles cannot browse the
+   repository in this milestone, only reason from supplied text. Founder
+   decision needed before loosening this to an allow-list, once this
+   CLI version's exact tool-name list is verified.
+6. **No DeepSeek Harness CLI is installed anywhere on this host**
+   (Milestone 4 addendum compatibility review). Only an HTTP API
+   provider plugin inside OpenClaw exists under that name — not a CLI
+   harness. DeepSeek compatibility with `ExecutionAdapter` therefore
+   remains unverified, and no DeepSeek adapter is implemented. See
+   [docs/EXECUTION_CLAUDE_CODE.md](docs/EXECUTION_CLAUDE_CODE.md).

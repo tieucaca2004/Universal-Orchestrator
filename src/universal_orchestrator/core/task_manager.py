@@ -26,6 +26,7 @@ from universal_orchestrator.core.models import (
 )
 from universal_orchestrator.core.state import StateManager
 from universal_orchestrator.errors import NotFoundError, OrchestratorError
+from universal_orchestrator.execution.adapter import ExecutionResult
 
 
 class InterruptedResolution(enum.Enum):
@@ -72,6 +73,20 @@ class TaskManager:
     def get_routing_decisions(self, task_id: str) -> list[RoutingDecision]:
         self._require(task_id)
         return self._state.get_routing_decisions(task_id)
+
+    def record_execution_result(self, result: ExecutionResult) -> None:
+        """Same bypass-prevention shape as `record_routing_decision`: an
+        `ExecutionAdapter` returns a result but never persists it
+        itself. `Task.status` is deliberately left untouched here — a
+        completed process is not proof the task's business objective
+        was met (see `ExecutionResult.success`'s docstring); that
+        judgement belongs to a later milestone (Quality Gate)."""
+        self._require(result.task_id)
+        self._state.save_execution_result(result)
+
+    def get_execution_results(self, task_id: str) -> list[ExecutionResult]:
+        self._require(task_id)
+        return self._state.get_execution_results(task_id)
 
     def _require(self, task_id: str) -> Task:
         task = self._tasks.get(task_id)

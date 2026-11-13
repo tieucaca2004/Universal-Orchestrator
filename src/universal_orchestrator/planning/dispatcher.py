@@ -21,6 +21,6 @@ class Dispatcher(ABC):
         """Hand `task` to `adapter` and return its result.
 
         Implementations must refuse to dispatch to an adapter whose
-        `verify()` has not returned `VerificationStatus.VERIFIED`.
+        `verify()` has not returned `VerificationStatus.AVAILABLE`.
         """
         raise NotImplementedError

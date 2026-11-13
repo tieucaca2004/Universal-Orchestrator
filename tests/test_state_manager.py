@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from datetime import datetime, timezone
+
 from universal_orchestrator.core.models import (
     RejectedCandidate,
     RoutingDecision,
@@ -14,6 +16,7 @@ from universal_orchestrator.core.models import (
 )
 from universal_orchestrator.core.state import StateManager
 from universal_orchestrator.errors import DuplicateError, NotFoundError
+from universal_orchestrator.execution.adapter import ExecutionOutcome, ExecutionResult, VerificationStatus
 
 
 class StateManagerTestCase(unittest.TestCase):
@@ -231,6 +234,69 @@ class RoutingDecisionPersistenceTests(StateManagerTestCase):
 
     def test_no_decisions_returns_empty_list(self):
         self.assertEqual(self.state.get_routing_decisions("task_missing"), [])
+
+
+class ExecutionResultPersistenceTests(StateManagerTestCase):
+    def test_save_then_get_round_trips_a_completed_result(self):
+        task = Task(title="t", project_id="proj_a")
+        self.state.create(task)
+        started = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        ended = datetime(2026, 1, 1, 0, 0, 3, tzinfo=timezone.utc)
+        result = ExecutionResult(
+            execution_id="exec_1",
+            task_id=task.task_id,
+            outcome=ExecutionOutcome.COMPLETED,
+            exit_code=0,
+            stdout="hello",
+            stderr="",
+            started_at=started,
+            ended_at=ended,
+            duration_seconds=3.0,
+            cli_version="2.1.221 (Claude Code)",
+            output_format="json",
+            structured_output={"result": "hello"},
+            structured_output_valid=True,
+            verification_status=VerificationStatus.AVAILABLE,
+        )
+
+        self.state.save_execution_result(result)
+        loaded = self.state.get_execution_results(task.task_id)
+
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].execution_id, "exec_1")
+        self.assertIs(loaded[0].outcome, ExecutionOutcome.COMPLETED)
+        self.assertEqual(loaded[0].structured_output, {"result": "hello"})
+        self.assertTrue(loaded[0].structured_output_valid)
+        self.assertIs(loaded[0].verification_status, VerificationStatus.AVAILABLE)
+        self.assertEqual(loaded[0].duration_seconds, 3.0)
+
+    def test_saving_an_execution_result_does_not_change_the_task_row(self):
+        task = Task(title="t", project_id="proj_a")
+        self.state.create(task)
+        before = self.state.get(task.task_id)
+
+        self.state.save_execution_result(
+            ExecutionResult(execution_id="exec_1", task_id=task.task_id, outcome=ExecutionOutcome.FAILED)
+        )
+
+        after = self.state.get(task.task_id)
+        self.assertEqual(after.status, before.status)
+        self.assertEqual(after.history, before.history)
+
+    def test_no_results_returns_empty_list(self):
+        self.assertEqual(self.state.get_execution_results("task_missing"), [])
+
+    def test_unverified_result_fields_default_to_none(self):
+        task = Task(title="t", project_id="proj_a")
+        self.state.create(task)
+        self.state.save_execution_result(
+            ExecutionResult(execution_id="exec_1", task_id=task.task_id, outcome=ExecutionOutcome.ERROR)
+        )
+
+        loaded = self.state.get_execution_results(task.task_id)[0]
+        self.assertIsNone(loaded.structured_output)
+        self.assertIsNone(loaded.structured_output_valid)
+        self.assertIsNone(loaded.verification_status)
 
 
 if __name__ == "__main__":

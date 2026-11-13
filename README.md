@@ -10,13 +10,15 @@ by absorbing or copying them.
 
 ## Status
 
-Milestone 3 — Project Registry, Agent Registry, Provider Registry and
-Agent Router. See [ARCHITECTURE.md](ARCHITECTURE.md) for the component
-map, the Founder-approved 8-milestone roadmap, and open architectural
+Milestone 4 — Claude Code CLI Adapter and verified non-interactive
+execution. See [ARCHITECTURE.md](ARCHITECTURE.md) for the component map,
+the Founder-approved 8-milestone roadmap, and open architectural
 questions; [docs/TASK_LIFECYCLE.md](docs/TASK_LIFECYCLE.md) for the task
 state machine; [docs/REGISTRIES.md](docs/REGISTRIES.md) for the registry
-schemas; and [docs/ROUTING.md](docs/ROUTING.md) for the routing
-algorithm.
+schemas; [docs/ROUTING.md](docs/ROUTING.md) for the routing algorithm;
+and [docs/EXECUTION_CLAUDE_CODE.md](docs/EXECUTION_CLAUDE_CODE.md) for
+the real, verified Claude CLI capabilities, security posture, and smoke
+test evidence.
 
 ## Stack
 
@@ -37,8 +39,10 @@ src/universal_orchestrator/
   registry/    project, agent and provider registries
   routing/     Agent Router — selects who should perform a task
   planning/    task planner and dispatcher interfaces
-  execution/   execution adapter interface (Claude Code, Gemini CLI,
-               DeepSeek, Kimi, OpenClaw, Hermes, future RTX 3070 worker)
+  execution/   execution adapter interface + ClaudeCodeAdapter (the
+               first real one) + AdapterRegistry for future engines
+               (DeepSeek Harness CLI — not installed, not implemented;
+               Hermes, future RTX 3070 worker — later milestones)
   approval/    approval gate for sensitive operations (a later milestone)
   audit/       structured logging (full audit trail in a later milestone)
   config/      configuration management
@@ -70,6 +74,11 @@ use plain `unittest.TestCase`s and don't depend on pytest-only features.
 
 No provider or agent is ever reported as operational until its actual
 execution and authentication have been verified against the live
-environment. See `core.models.ProviderDescriptor.verified`,
-`execution.adapter.ExecutionAdapter.verify`, and
-`errors.ProviderNotVerifiedError`.
+environment. `execution.claude_code.ClaudeCodeAdapter.verify()` is the
+first real implementation of this policy — it runs `claude --version`,
+`claude --help`, and `claude auth status` against the actual installed
+CLI and returns `AVAILABLE` only if all three succeed. See
+`core.models.ProviderDescriptor.verified`,
+`execution.adapter.ExecutionAdapter.verify`,
+`errors.ProviderNotVerifiedError`, and
+[docs/EXECUTION_CLAUDE_CODE.md](docs/EXECUTION_CLAUDE_CODE.md).

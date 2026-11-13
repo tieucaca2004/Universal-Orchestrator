@@ -15,11 +15,38 @@ from universal_orchestrator.core.models import (
     TaskStatus,
 )
 from universal_orchestrator.core.state import StateManager
-from universal_orchestrator.errors import NotFoundError
+from universal_orchestrator.errors import NotFoundError, OrchestratorError
+from universal_orchestrator.execution.adapter import (
+    ExecutionAdapter,
+    ExecutionOutcome,
+    ExecutionResult,
+    VerificationStatus,
+)
+from universal_orchestrator.execution.registry import AdapterRegistry
 from universal_orchestrator.registry.agents import AgentRegistry
 from universal_orchestrator.registry.projects import ProjectRegistry
 from universal_orchestrator.registry.providers import ProviderRegistry
 from universal_orchestrator.routing.router import AgentRouter
+
+
+class _FakeExecutionAdapter(ExecutionAdapter):
+    """Deterministic test double — never a real Claude CLI call."""
+
+    def __init__(self, outcome: ExecutionOutcome = ExecutionOutcome.COMPLETED):
+        self._outcome = outcome
+        self.received_requests = []
+
+    def verify(self):
+        return VerificationStatus.AVAILABLE
+
+    def execute(self, request):
+        self.received_requests.append(request)
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            task_id=request.task_id,
+            outcome=self._outcome,
+            exit_code=0 if self._outcome is ExecutionOutcome.COMPLETED else 1,
+        )
 
 
 class _BrokenAnalyzer(TaskAnalyzer):
@@ -206,6 +233,125 @@ class RoutingIntegrationTests(EngineTestCase):
 
         with self.assertRaises(NotFoundError):
             engine.route("task_missing", profile)
+
+
+class ExecutionIntegrationTests(EngineTestCase):
+    """Task Manager -> Agent Router's decision -> Execution Adapter ->
+    Task Manager, exactly the Milestone 4 flow, using a fake adapter —
+    no real Claude CLI call belongs in this test module."""
+
+    def setUp(self):
+        super().setUp()
+        self.projects = ProjectRegistry()
+        self.agents = AgentRegistry()
+        self.providers = ProviderRegistry()
+        self._sandbox = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._sandbox.cleanup()
+        super().tearDown()
+
+    def _registered_profile(self, **overrides):
+        defaults = {"name": "demo", "repository_path": "/workspace/demo"}
+        defaults.update(overrides)
+        return self.projects.register(ProjectProfile(**defaults))
+
+    def _available_agent(self, **overrides):
+        defaults = {"name": "coder-a", "role": "coder", "capabilities": ["python"]}
+        defaults.update(overrides)
+        agent = self.agents.register(AgentDescriptor(**defaults))
+        self.agents.set_status(agent.agent_id, AgentStatus.AVAILABLE)
+        return agent
+
+    def _verified_provider(self, **overrides):
+        defaults = {"name": "anthropic", "kind": "api"}
+        defaults.update(overrides)
+        provider = self.providers.register(ProviderDescriptor(**defaults))
+        self.providers.set_verified(provider.provider_id, True)
+        self.providers.set_status(provider.provider_id, ProviderStatus.AVAILABLE)
+        return provider
+
+    def _wired_engine(self, fake_adapter: _FakeExecutionAdapter):
+        router = AgentRouter(self.agents, self.providers)
+        adapters = AdapterRegistry()
+        provider = self._verified_provider()
+        self._available_agent(provider_id=provider.provider_id)
+        adapters.register(provider.provider_id, fake_adapter)
+        engine = OrchestrationEngine.bootstrap(
+            self.state, router=router, adapters=adapters, agents=self.agents
+        )
+        return engine, provider
+
+    def test_route_then_execute_persists_a_completed_result(self):
+        fake_adapter = _FakeExecutionAdapter(ExecutionOutcome.COMPLETED)
+        engine, _provider = self._wired_engine(fake_adapter)
+        profile = self._registered_profile()
+
+        task = engine.submit(self._request(), profile)
+        engine.route(task.task_id, profile)
+        result = engine.execute(task.task_id, working_directory=self._sandbox.name)
+
+        self.assertIs(result.outcome, ExecutionOutcome.COMPLETED)
+        persisted = engine.manager.get_execution_results(task.task_id)
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(persisted[0].execution_id, result.execution_id)
+
+    def test_execute_without_routing_first_raises(self):
+        fake_adapter = _FakeExecutionAdapter()
+        engine, _provider = self._wired_engine(fake_adapter)
+        profile = self._registered_profile()
+        task = engine.submit(self._request(), profile)
+
+        with self.assertRaises(OrchestratorError):
+            engine.execute(task.task_id, working_directory=self._sandbox.name)
+
+    def test_execute_after_no_eligible_agent_raises(self):
+        fake_adapter = _FakeExecutionAdapter()
+        router = AgentRouter(self.agents, self.providers)  # no agents registered
+        adapters = AdapterRegistry()
+        engine = OrchestrationEngine.bootstrap(self.state, router=router, adapters=adapters)
+        profile = self._registered_profile()
+        task = engine.submit(self._request(), profile)
+        engine.route(task.task_id, profile)
+
+        with self.assertRaises(OrchestratorError):
+            engine.execute(task.task_id, working_directory=self._sandbox.name)
+
+    def test_execute_without_adapter_registry_raises(self):
+        router = AgentRouter(self.agents, self.providers)
+        engine = OrchestrationEngine.bootstrap(self.state, router=router)  # no adapters
+        profile = self._registered_profile()
+        task = engine.submit(self._request(), profile)
+
+        with self.assertRaises(RuntimeError):
+            engine.execute(task.task_id, working_directory=self._sandbox.name)
+
+    def test_execute_passes_the_agent_role_and_correlation_id_through(self):
+        fake_adapter = _FakeExecutionAdapter()
+        engine, provider = self._wired_engine(fake_adapter)
+        profile = self._registered_profile()
+        task = engine.submit(self._request(), profile)
+        decision = engine.route(task.task_id, profile)
+
+        engine.execute(task.task_id, working_directory=self._sandbox.name)
+
+        sent = fake_adapter.received_requests[0]
+        self.assertEqual(sent.agent_role, "coder")
+        self.assertEqual(sent.correlation_id, decision.decision_id)
+        self.assertEqual(sent.provider_id, provider.provider_id)
+
+    def test_adapter_error_propagates_but_still_records_nothing_as_task_status(self):
+        fake_adapter = _FakeExecutionAdapter(ExecutionOutcome.FAILED)
+        engine, _provider = self._wired_engine(fake_adapter)
+        profile = self._registered_profile()
+        task = engine.submit(self._request(), profile)
+        engine.route(task.task_id, profile)
+
+        status_before = engine.manager.get(task.task_id).status
+        result = engine.execute(task.task_id, working_directory=self._sandbox.name)
+
+        self.assertIs(result.outcome, ExecutionOutcome.FAILED)
+        self.assertIs(engine.manager.get(task.task_id).status, status_before)
 
 
 if __name__ == "__main__":
