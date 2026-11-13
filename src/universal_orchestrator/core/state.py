@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from universal_orchestrator.core.models import (
@@ -31,6 +31,7 @@ from universal_orchestrator.execution.adapter import (
     ExecutionResult,
     VerificationStatus,
 )
+from universal_orchestrator.execution.conflict import ConflictReport
 from universal_orchestrator.execution.worktree import WorktreeHandle, WorktreeStatus
 
 _SCHEMA = """
@@ -112,6 +113,33 @@ CREATE TABLE IF NOT EXISTS worktrees (
 );
 CREATE INDEX IF NOT EXISTS idx_worktrees_project_id ON worktrees(project_id);
 CREATE INDEX IF NOT EXISTS idx_worktrees_status ON worktrees(status);
+
+-- Milestone 6.2: every conflict check is tagged with the exact target-
+-- branch SHA it was run against (`base_sha`) — this is what lets a
+-- stale report be detected and rejected before integration, never
+-- trusted just because it exists.
+CREATE TABLE IF NOT EXISTS conflict_reports (
+    report_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    worktree_branch TEXT NOT NULL,
+    path_overlap TEXT NOT NULL DEFAULT '{}',
+    tier2_conflicting INTEGER NOT NULL,
+    tier2_conflicting_files TEXT NOT NULL DEFAULT '[]',
+    checked_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conflict_reports_task_id ON conflict_reports(task_id);
+
+-- Milestone 6.2: a single-row mutex. Real Git integration into the
+-- target branch must be serialized — many Agents may execute and
+-- prepare changes concurrently, but only one integration may actually
+-- be in flight at a time. `holder_task_id IS NULL` means free.
+CREATE TABLE IF NOT EXISTS integration_lock (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    holder_task_id TEXT,
+    acquired_at TEXT
+);
 """
 
 _COLUMNS = (
@@ -138,7 +166,15 @@ class StateManager:
     def __init__(self, db_path: Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path), isolation_level=None)
+        # check_same_thread=False (Milestone 6.2): the integration lock
+        # must be provably atomic under real concurrent callers, not just
+        # sequential calls — SQLite's own single-writer locking is what
+        # actually serializes the UPDATE in `acquire_integration_lock`,
+        # this connection just needs to be usable from more than one
+        # thread to let a real concurrency test exercise that.
+        self._conn = sqlite3.connect(
+            str(self.db_path), isolation_level=None, check_same_thread=False
+        )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._initialize()
@@ -146,6 +182,10 @@ class StateManager:
     def _initialize(self) -> None:
         with self._conn:
             self._conn.executescript(_SCHEMA)
+            self._conn.execute(
+                "INSERT OR IGNORE INTO integration_lock (id, holder_task_id, acquired_at) "
+                "VALUES (1, NULL, NULL)"
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -363,6 +403,76 @@ class StateManager:
         cursor = self._conn.execute(query, params)
         return [_row_to_worktree(row) for row in cursor.fetchall()]
 
+    # -- conflict reports (Milestone 6.2) --------------------------------------
+
+    def save_conflict_report(self, report: ConflictReport) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO conflict_reports (
+                    report_id, task_id, project_id, base_sha, worktree_branch,
+                    path_overlap, tier2_conflicting, tier2_conflicting_files,
+                    checked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    report.report_id,
+                    report.task_id,
+                    report.project_id,
+                    report.base_sha,
+                    report.worktree_branch,
+                    json.dumps(report.path_overlap),
+                    int(report.tier2_conflicting),
+                    json.dumps(report.tier2_conflicting_files),
+                    report.checked_at.isoformat(),
+                ),
+            )
+
+    def get_conflict_reports(self, task_id: str) -> list[ConflictReport]:
+        cursor = self._conn.execute(
+            "SELECT * FROM conflict_reports WHERE task_id = ? ORDER BY checked_at",
+            (task_id,),
+        )
+        return [_row_to_conflict_report(row) for row in cursor.fetchall()]
+
+    def latest_conflict_report(self, task_id: str) -> ConflictReport | None:
+        reports = self.get_conflict_reports(task_id)
+        return reports[-1] if reports else None
+
+    # -- integration lock (Milestone 6.2) --------------------------------------
+
+    def acquire_integration_lock(self, holder_task_id: str) -> bool:
+        """Atomic: only succeeds if the lock is currently free
+        (`holder_task_id IS NULL`). SQLite's own single-writer locking
+        on this connection is what makes the UPDATE itself atomic even
+        under real concurrent callers — never a check-then-write race
+        at the Python level."""
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE integration_lock SET holder_task_id = ?, acquired_at = ? "
+                "WHERE id = 1 AND holder_task_id IS NULL",
+                (holder_task_id, datetime.now(timezone.utc).isoformat()),
+            )
+        return cursor.rowcount == 1
+
+    def release_integration_lock(self, holder_task_id: str) -> bool:
+        """Only the actual holder may release — never a bare `release()`
+        that could free a lock someone else is legitimately holding."""
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE integration_lock SET holder_task_id = NULL, acquired_at = NULL "
+                "WHERE id = 1 AND holder_task_id = ?",
+                (holder_task_id,),
+            )
+        return cursor.rowcount == 1
+
+    def current_integration_lock_holder(self) -> str | None:
+        cursor = self._conn.execute(
+            "SELECT holder_task_id FROM integration_lock WHERE id = 1"
+        )
+        row = cursor.fetchone()
+        return row["holder_task_id"] if row is not None else None
+
 
 def _task_to_row(task: Task) -> dict[str, object]:
     return {
@@ -462,4 +572,18 @@ def _row_to_worktree(row: sqlite3.Row) -> WorktreeHandle:
         status=WorktreeStatus(row["status"]),
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+def _row_to_conflict_report(row: sqlite3.Row) -> ConflictReport:
+    return ConflictReport(
+        report_id=row["report_id"],
+        task_id=row["task_id"],
+        project_id=row["project_id"],
+        base_sha=row["base_sha"],
+        worktree_branch=row["worktree_branch"],
+        path_overlap=json.loads(row["path_overlap"]),
+        tier2_conflicting=bool(row["tier2_conflicting"]),
+        tier2_conflicting_files=json.loads(row["tier2_conflicting_files"]),
+        checked_at=datetime.fromisoformat(row["checked_at"]),
     )
