@@ -587,6 +587,24 @@ class StateManager:
         row = cursor.fetchone()
         return _row_to_integration_proposal(row) if row is not None else None
 
+    def list_latest_integration_proposals(self) -> list[IntegrationProposal]:
+        """One row per `task_id` — its most recent proposal only, never
+        a superseded one. Used by the Approval CLI (Milestone 6
+        remediation, Item 2) to enumerate what a Founder could review;
+        never used to infer which ones still need a decision — that is
+        `approval_decisions`' job, checked separately."""
+        cursor = self._conn.execute(
+            """
+            SELECT p.* FROM integration_proposals p
+            WHERE p.proposed_at = (
+                SELECT MAX(proposed_at) FROM integration_proposals
+                WHERE task_id = p.task_id
+            )
+            ORDER BY p.proposed_at
+            """
+        )
+        return [_row_to_integration_proposal(row) for row in cursor.fetchall()]
+
     # -- approval decisions (Milestone 6.3) ------------------------------------
 
     def save_approval_decision(self, decision: ApprovalDecision) -> None:

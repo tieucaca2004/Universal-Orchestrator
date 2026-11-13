@@ -89,6 +89,25 @@ class ApprovalGate:
     def get_proposal(self, task_id: str) -> IntegrationProposal | None:
         return self._state.latest_integration_proposal(task_id)
 
+    def list_proposals(self) -> list[IntegrationProposal]:
+        """Every task's most recent proposal — used by the Approval
+        CLI (Milestone 6 remediation, Item 2) to enumerate what exists.
+        Does not itself say which ones are still awaiting a decision;
+        see `is_pending`."""
+        return self._state.list_latest_integration_proposals()
+
+    def is_pending(self, proposal: IntegrationProposal) -> bool:
+        """True exactly when no decision has been recorded for this
+        proposal's exact `(action, diff_identity)` — never inferred
+        from whether a *different* diff for the same task was
+        decided."""
+        decisions = [
+            d
+            for d in self._state.get_approval_decisions(proposal.task_id)
+            if d.action == proposal.action and d.diff_identity == proposal.diff_identity
+        ]
+        return not decisions
+
     # -- recording a decision -----------------------------------------
 
     def record_decision(

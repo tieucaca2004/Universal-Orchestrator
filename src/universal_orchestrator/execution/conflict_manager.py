@@ -132,6 +132,13 @@ class ConflictManager:
     def current_integration_lock_holder(self) -> str | None:
         return self._state.current_integration_lock_holder()
 
+    def get_reports(self, task_id: str) -> list[ConflictReport]:
+        """All conflict reports ever recorded for this task, oldest
+        first — used by the Approval CLI (Milestone 6 remediation,
+        Item 2) to show the exact report a proposal was built from,
+        not merely the latest one."""
+        return self._state.get_conflict_reports(task_id)
+
     # -- internals -----------------------------------------------------
 
     def _changed_paths(self, task_id: str, repo: Path, base_sha: str, branch: str) -> set[str]:
