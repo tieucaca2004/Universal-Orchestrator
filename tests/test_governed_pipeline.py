@@ -1,0 +1,262 @@
+"""M6 remediation, Item 1 — Governed Execution Pipeline.
+
+Proves the full automatic sequence (submit -> route -> Worktree ->
+dispatch -> Quality Gate -> Conflict check -> Proposal -> STOP ->
+Approval -> revalidate -> lock -> integrate -> post-integration
+Quality Gate -> Worktree resolution) using the *real* `ClaudeCodeAdapter`
+against a minimal, deterministic fake executable (never a real Claude
+call — same pattern as tests/test_multi_runtime.py) and real Git
+repositories.
+"""
+
+import stat
+import subprocess
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+
+from universal_orchestrator.core.engine import OrchestrationEngine
+from universal_orchestrator.core.governed_pipeline import GovernedPipeline, IntegrationBlockedError
+from universal_orchestrator.core.models import (
+    AgentDescriptor,
+    AgentStatus,
+    ProjectProfile,
+    ProviderDescriptor,
+    ProviderStatus,
+    TaskRequest,
+)
+from universal_orchestrator.core.state import StateManager
+from universal_orchestrator.errors import ApprovalRequiredError
+from universal_orchestrator.execution.approval import ApprovalDecisionType
+from universal_orchestrator.execution.approval_manager import ApprovalGate
+from universal_orchestrator.execution.claude_code import ClaudeCodeAdapter
+from universal_orchestrator.execution.conflict_manager import ConflictManager
+from universal_orchestrator.execution.quality import QualityVerdict
+from universal_orchestrator.execution.quality_manager import QualityGate
+from universal_orchestrator.execution.registry import AdapterRegistry
+from universal_orchestrator.execution.worktree import WorktreeStatus
+from universal_orchestrator.execution.worktree_manager import WorktreeManager
+from universal_orchestrator.registry.agents import AgentRegistry
+from universal_orchestrator.registry.providers import ProviderRegistry
+from universal_orchestrator.routing.router import AgentRouter
+
+# Writes a real file into its own cwd (the Worktree, since
+# ClaudeCodeAdapter passes cwd=request.working_directory) — simulates
+# the Agent's actual work product, never a real Claude call.
+_FAKE_CLAUDE = textwrap.dedent(
+    """\
+    #!/usr/bin/env python3
+    import json, sys
+    args = sys.argv[1:]
+    if args == ["--version"]:
+        print("9.9.9 (Fake Claude)"); sys.exit(0)
+    if args == ["--help"]:
+        print(
+            "-p, --print\\n--output-format\\n--tools\\n--no-session-persistence\\n"
+            "--safe-mode\\n--strict-mcp-config\\n--disable-slash-commands\\n--setting-sources\\n"
+        )
+        sys.exit(0)
+    if len(args) >= 2 and args[0:2] == ["auth", "status"]:
+        print(json.dumps({"loggedIn": True})); sys.exit(0)
+    prompt = args[0] if args else ""
+    open("agent_output.txt", "w").write("fake agent output\\n")
+    print(json.dumps({"is_error": False, "result": f"claude:{prompt}"})); sys.exit(0)
+    """
+)
+
+
+def _write_fake_claude(tmp_dir: Path) -> str:
+    path = tmp_dir / "fake_claude"
+    path.write_text(_FAKE_CLAUDE)
+    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return str(path)
+
+
+def _run(args: list[str], cwd: Path) -> str:
+    result = subprocess.run(args, cwd=str(cwd), capture_output=True, text=True, check=True)
+    return result.stdout
+
+
+def _init_repo(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    _run(["git", "init", "-q", "-b", "main"], path)
+    _run(["git", "config", "user.email", "test@example.com"], path)
+    _run(["git", "config", "user.name", "Test"], path)
+    (path / "README.md").write_text("original\n")
+    _run(["git", "add", "README.md"], path)
+    _run(["git", "commit", "-q", "-m", "initial"], path)
+
+
+class GovernedPipelineTestCase(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._tmpdir.name)
+        self.repo_path = self.tmp_path / "project"
+        _init_repo(self.repo_path)
+        self.claude_bin = _write_fake_claude(self.tmp_path)
+
+        self.state = StateManager(self.tmp_path / "orchestrator.sqlite3")
+        self.agents = AgentRegistry()
+        self.providers = ProviderRegistry()
+        self.adapters = AdapterRegistry()
+        self.adapters.register("prov_claude", ClaudeCodeAdapter(executable=self.claude_bin))
+
+        provider = self.providers.register(ProviderDescriptor(name="anthropic", kind="cli"))
+        self.providers.set_verified(provider.provider_id, True)
+        self.providers.set_status(provider.provider_id, ProviderStatus.AVAILABLE)
+        self.provider_id = provider.provider_id
+        self.adapters.register(provider.provider_id, ClaudeCodeAdapter(executable=self.claude_bin))
+
+        agent = self.agents.register(
+            AgentDescriptor(name="claude-coder", role="coder", provider_id=provider.provider_id)
+        )
+        self.agents.set_status(agent.agent_id, AgentStatus.AVAILABLE)
+        self.agent_id = agent.agent_id
+
+        router = AgentRouter(self.agents, self.providers)
+        self.engine = OrchestrationEngine.bootstrap(
+            self.state, router=router, adapters=self.adapters, agents=self.agents, providers=self.providers
+        )
+
+        self.worktrees = WorktreeManager(self.state)
+        self.conflicts = ConflictManager(self.state, self.worktrees)
+        self.approvals = ApprovalGate(self.state)
+        self.quality = QualityGate(self.state)
+        self.pipeline = GovernedPipeline(
+            self.engine, self.worktrees, self.conflicts, self.approvals, self.quality
+        )
+
+        self.project = ProjectProfile(
+            name="demo",
+            repository_path=str(self.repo_path),
+            project_id="proj_x",
+            required_testing_commands=[
+                f"python3 -c \"import pathlib,sys; "
+                f"sys.exit(0 if pathlib.Path('{self.repo_path}/agent_output.txt').exists() else 1)\""
+            ],
+        )
+
+    def tearDown(self):
+        self.state.close()
+        self._tmpdir.cleanup()
+
+    def _submit_and_route(self, title: str = "write agent_output.txt"):
+        task = self.engine.submit(
+            TaskRequest(
+                title=title,
+                metadata={
+                    "acceptance_criteria": ["creates agent_output.txt"],
+                    "expected_deliverables": ["agent_output.txt"],
+                },
+            ),
+            self.project,
+        )
+        task_obj = self.engine.manager.get(task.task_id)
+        task_obj.payload["required_role"] = "coder"
+        self.engine.route(task.task_id, self.project)
+        return task.task_id
+
+
+class HappyPathTests(GovernedPipelineTestCase):
+    def test_full_pipeline_submit_to_integrated(self):
+        task_id = self._submit_and_route()
+
+        proposal = self.pipeline.submit_for_approval(
+            task_id, self.project, criteria_evidence={"creates agent_output.txt": True}
+        )
+
+        self.assertIsNotNone(proposal)
+        self.assertFalse(proposal.conflict_blocks)
+        self.assertEqual(self.worktrees.get(task_id).status, WorktreeStatus.AWAITING_APPROVAL)
+        self.assertEqual(self.engine.manager.get(task_id).status.value, "succeeded")
+
+        # Approval Gate is the only way past this point.
+        self.approvals.record_decision(proposal, ApprovalDecisionType.APPROVED, reason="looks good")
+
+        integration_report = self.pipeline.integrate_after_approval(task_id, self.project)
+
+        self.assertIs(integration_report.verdict, QualityVerdict.PASS)
+        self.assertEqual(self.worktrees.get(task_id).status, WorktreeStatus.RELEASED)
+        self.assertTrue((self.repo_path / "agent_output.txt").exists())
+        self.assertIsNone(self.conflicts.current_integration_lock_holder())
+
+
+class BypassPreventionTests(GovernedPipelineTestCase):
+    def test_cannot_integrate_without_approval(self):
+        task_id = self._submit_and_route()
+        self.pipeline.submit_for_approval(
+            task_id, self.project, criteria_evidence={"creates agent_output.txt": True}
+        )
+
+        with self.assertRaises(ApprovalRequiredError):
+            self.pipeline.integrate_after_approval(task_id, self.project)
+
+        # Refusal must not have touched main or the Worktree.
+        self.assertFalse((self.repo_path / "agent_output.txt").exists())
+        self.assertEqual(self.worktrees.get(task_id).status, WorktreeStatus.AWAITING_APPROVAL)
+
+    def test_cannot_succeed_without_quality_gate_pass(self):
+        task_id = self._submit_and_route()
+
+        # No criteria_evidence supplied at all -> NOT_VERIFIED, never PASS.
+        proposal = self.pipeline.submit_for_approval(task_id, self.project)
+
+        self.assertIsNone(proposal)
+        self.assertEqual(self.engine.manager.get(task_id).status.value, "failed")
+        self.assertEqual(self.worktrees.get(task_id).status, WorktreeStatus.NEEDS_REVIEW)
+
+    def test_cannot_integrate_with_a_real_conflict_on_revalidation(self):
+        task_id = self._submit_and_route()
+        proposal = self.pipeline.submit_for_approval(
+            task_id, self.project, criteria_evidence={"creates agent_output.txt": True}
+        )
+        self.approvals.record_decision(proposal, ApprovalDecisionType.APPROVED)
+
+        # Simulate a different, already-approved integration landing on
+        # main first, creating the *same* file with different content —
+        # a real add/add conflict with this task's own branch.
+        (self.repo_path / "agent_output.txt").write_text("a different agent's output\n")
+        _run(["git", "add", "agent_output.txt"], self.repo_path)
+        _run(["git", "commit", "-q", "-m", "a different integration landed first"], self.repo_path)
+
+        with self.assertRaises(IntegrationBlockedError):
+            self.pipeline.integrate_after_approval(task_id, self.project)
+
+        self.assertEqual(self.worktrees.get(task_id).status, WorktreeStatus.NEEDS_REVIEW)
+        # main was not forced, not reset — the other integration's
+        # content is exactly what's there, untouched by this failure.
+        self.assertEqual(
+            (self.repo_path / "agent_output.txt").read_text(), "a different agent's output\n"
+        )
+        self.assertIsNone(self.conflicts.current_integration_lock_holder())
+
+    def test_post_integration_quality_failure_preserves_worktree_and_does_not_revert_main(self):
+        task_id = self._submit_and_route()
+        proposal = self.pipeline.submit_for_approval(
+            task_id, self.project, criteria_evidence={"creates agent_output.txt": True}
+        )
+        self.approvals.record_decision(proposal, ApprovalDecisionType.APPROVED)
+
+        # A required testing command that will fail for real, regardless
+        # of the merge outcome.
+        broken_project = ProjectProfile(
+            name="demo",
+            repository_path=str(self.repo_path),
+            project_id="proj_x",
+            required_testing_commands=["python3 -c \"import sys; sys.exit(1)\""],
+        )
+
+        integration_report = self.pipeline.integrate_after_approval(task_id, broken_project)
+
+        self.assertIs(integration_report.verdict, QualityVerdict.FAIL)
+        self.assertEqual(self.worktrees.get(task_id).status, WorktreeStatus.NEEDS_REVIEW)
+        # The merge itself already happened (that's what post-integration
+        # verification checks) — main is not reverted.
+        self.assertTrue((self.repo_path / "agent_output.txt").exists())
+        # The Worktree itself is not deleted — still inspectable.
+        self.assertTrue(Path(self.worktrees.get(task_id).path).exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
