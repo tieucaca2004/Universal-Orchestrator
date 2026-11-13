@@ -429,6 +429,25 @@ basis stated next to it. Where Phase-0-era discovery produced a claim
 this session did not re-check, it is marked **UNKNOWN**, not reasserted
 as current fact.
 
+**Hardware-independence (Founder direction — fresh evidence this
+session):** a repository-wide search of `.py` files for hardcoded
+hostnames, IPs, or resource constants found none in executable code —
+`config/settings.py` derives every path from `__file__` and
+environment variables; `ClaudeCodeAdapter`/`HermesAdapter` resolve
+their target via `PATH`/an explicit override, never a hardcoded
+absolute path; `AgentDescriptor.machine` is, and always was, a
+free-text label the Router/Task Manager/State Manager never read.
+**The Orchestrator itself is not bound to this NUC** — running it on a
+stronger machine instead requires no code change. What does not exist
+yet is a *remote*-execution adapter (today's two adapters both run
+locally relative to wherever the Orchestrator process is); adding one
+remains possible through the existing `ExecutionAdapter`/
+`AdapterRegistry` mechanism alone, without touching the Engine, Task
+Manager, or any M6 component. See [ROADMAP.md](ROADMAP.md) §10.5 for
+the full constraint this places on M6's four components — this is a
+design discipline on existing scope, not a new component, and does not
+authorize connecting a second machine.
+
 ---
 
 ## J. Architecture Diagrams

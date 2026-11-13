@@ -561,6 +561,80 @@ below may be implemented in a way that touches either.
   task whose execution result is correctly judged against its own
   acceptance criteria.
 
+### 10.5 Cross-cutting constraint: Hardware-Independent Architecture (Founder direction, applies to all four components above — not a fifth component)
+
+Founder's stated direction: Universal-Orchestrator currently runs on a
+resource-constrained Intel NUC; Founder intends, in the future, to run
+most Agent execution on stronger hardware. The architecture must not
+be rewritten to make that move possible — it must already allow it.
+
+**Evidence gathered this session (fresh, not reused from a prior
+claim) — this requirement is, to a large extent, already satisfied by
+existing design, not a gap M6 needs to close:**
+
+- `config/settings.py`'s `_repo_root()` derives every path from
+  `__file__` and environment variables (`UO_DATA_DIR`, `UO_LOG_DIR`,
+  `UO_CONFIG_FILE`, ...) — **no hostname, IP, or machine-specific path
+  is hardcoded anywhere in this module.**
+- `ClaudeCodeAdapter.__init__(executable: str = "claude", ...)` and
+  `HermesAdapter.__init__(..., docker_bin: str = "docker", ...)` both
+  resolve their target via `PATH` (or an explicit override), never a
+  hardcoded absolute path — re-confirmed by direct source read this
+  session.
+- A repository-wide search for hardcoded hostnames/IPs/resource
+  constants in `.py` files found exactly two hits, both in comments,
+  neither in executable code: `core/models.py`'s existing
+  `AgentDescriptor.machine` docstring (already documented as "a
+  logical label only... never a real hostname, IP or path") and
+  `config/settings.py`'s docstring explaining *why* the defaults are
+  lightweight — not a hardcoded ceiling anywhere a program could trip
+  over.
+- `AgentDescriptor.machine` (M3) was already a free-text logical label
+  — the Router, Task Manager, and State Manager never read or depend
+  on its value.
+
+**What genuinely does not exist yet, and why that's a smaller gap than
+it sounds:** there is no adapter today that dispatches to a runtime on
+a *different* machine over a network — `ClaudeCodeAdapter` runs a
+local `subprocess`, `HermesAdapter` runs a local `docker exec`. Both
+are concrete implementations of the same abstract `ExecutionAdapter`
+interface (`verify()`/`execute()`), and that interface itself carries
+no assumption about locality — `OrchestrationEngine`, `AgentRouter`,
+`TaskManager`, and the planned Approval/Quality/Conflict Gate
+components (§10.1–§10.4) only ever talk to an adapter through this
+contract, never to a machine directly. **The practical, zero-new-code
+path to Founder's stated goal is simply running this same Orchestrator
+process on the stronger machine instead of the NUC** — nothing in
+`core/`, `registry/`, or `routing/` binds it to any specific host.
+Moving *only* the execution runtime (keeping the Orchestrator itself on
+the NUC, reaching a remote Claude/Hermes over the network) would
+require a new concrete adapter — out of scope for M6 and explicitly not
+authorized here.
+
+**Binding constraint on M6's four components (§10.1–§10.4), stated so
+it is not forgotten once implementation starts — not new scope, a
+design discipline applied to the scope that already exists:**
+- **Git Worktree Manager (§10.1):** worktree paths must be derived from
+  `ProjectProfile.repository_path` and the existing `config/settings.py`
+  pattern (env-var/config-driven, relative to a resolved root) —
+  **never** a path hardcoded to this NUC's filesystem layout.
+- **Conflict Manager, Approval Gate, Quality Gate (§10.2–§10.4):** none
+  of the three reads or depends on `AgentDescriptor.machine`,
+  hostname, or any hardware characteristic — they operate on worktree
+  paths, diffs, `TaskSpecification`, and `ExecutionResult`, all of
+  which are already machine-agnostic data.
+- **Adding a future remote-execution adapter** (not part of M6) must
+  remain possible through the existing `ExecutionAdapter`/
+  `AdapterRegistry` mechanism alone — without changing
+  `OrchestrationEngine`, `TaskManager`, or any of M6's four components.
+  This is a property to preserve, not a component to build now.
+
+**This subsection does not create a fifth M6 component, does not start
+a distributed-systems effort, and does not approve connecting a second
+machine.** It records a design discipline against the four
+already-approved components, and documents that most of the stated
+goal is already true of the existing codebase.
+
 **Risk, recorded rather than acted on:** these four components are
 substantial; bundling them into one milestone risks scope creep.
 Flagged as a risk only — not resequenced without Founder approval.
