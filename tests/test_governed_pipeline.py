@@ -27,7 +27,7 @@ from universal_orchestrator.core.models import (
     TaskRequest,
 )
 from universal_orchestrator.core.state import StateManager
-from universal_orchestrator.errors import ApprovalRequiredError
+from universal_orchestrator.errors import ApprovalRequiredError, OrchestratorError
 from universal_orchestrator.execution.approval import ApprovalDecisionType
 from universal_orchestrator.execution.approval_manager import ApprovalGate
 from universal_orchestrator.execution.claude_code import ClaudeCodeAdapter
@@ -180,6 +180,76 @@ class HappyPathTests(GovernedPipelineTestCase):
         self.assertEqual(self.worktrees.get(task_id).status, WorktreeStatus.RELEASED)
         self.assertTrue((self.repo_path / "agent_output.txt").exists())
         self.assertIsNone(self.conflicts.current_integration_lock_holder())
+
+
+class EvidenceLifecycleTests(GovernedPipelineTestCase):
+    """M6 remediation (round 2), Item 1: evidence must be collected
+    strictly *after* the real ExecutionResult exists, never fabricated
+    ahead of dispatch. `dispatch()` and `evaluate_and_propose()` are
+    the two separate calls that make this possible."""
+
+    def test_evidence_is_collected_from_the_real_result_after_dispatch(self):
+        task_id = self._submit_and_route()
+
+        # dispatch() runs the real (fake-executable) Claude call and
+        # returns the real ExecutionResult -- no evidence exists yet.
+        result = self.pipeline.dispatch(task_id, self.project)
+        self.assertEqual(result.outcome.value, "completed")
+        self.assertEqual(self.worktrees.get(task_id).status, WorktreeStatus.QUALITY_CHECK)
+
+        # Evidence is built only now, by inspecting what the real
+        # (fake-executable) call actually produced in the Worktree --
+        # never supplied before dispatch() ran.
+        file_exists = (Path(self.worktrees.get(task_id).path) / "agent_output.txt").exists()
+        real_evidence = {"creates agent_output.txt": file_exists}
+
+        proposal = self.pipeline.evaluate_and_propose(
+            task_id, self.project, criteria_evidence=real_evidence
+        )
+
+        self.assertIsNotNone(proposal)
+        self.assertEqual(self.worktrees.get(task_id).status, WorktreeStatus.AWAITING_APPROVAL)
+        self.assertEqual(self.engine.manager.get(task_id).status.value, "succeeded")
+
+    def test_evaluate_and_propose_refuses_without_a_prior_dispatch(self):
+        task_id = self._submit_and_route()
+        with self.assertRaises(OrchestratorError):
+            self.pipeline.evaluate_and_propose(task_id, self.project, criteria_evidence={"x": True})
+
+    def test_evaluate_and_propose_refuses_if_called_twice(self):
+        task_id = self._submit_and_route()
+        self.pipeline.dispatch(task_id, self.project)
+        self.pipeline.evaluate_and_propose(
+            task_id, self.project, criteria_evidence={"creates agent_output.txt": True}
+        )
+        # Worktree is now AWAITING_APPROVAL, not QUALITY_CHECK -- a
+        # second evaluate_and_propose() call must be refused, not
+        # silently re-run.
+        with self.assertRaises(OrchestratorError):
+            self.pipeline.evaluate_and_propose(
+                task_id, self.project, criteria_evidence={"creates agent_output.txt": True}
+            )
+
+    def test_missing_evidence_after_dispatch_still_produces_not_verified_never_pass(self):
+        task_id = self._submit_and_route()
+        self.pipeline.dispatch(task_id, self.project)
+
+        proposal = self.pipeline.evaluate_and_propose(task_id, self.project)  # no evidence at all
+
+        self.assertIsNone(proposal)
+        self.assertEqual(self.engine.manager.get(task_id).status.value, "failed")
+        self.assertEqual(self.worktrees.get(task_id).status, WorktreeStatus.NEEDS_REVIEW)
+
+    def test_submit_for_approval_wrapper_still_works_unchanged(self):
+        """Backward compatibility: the single-call wrapper is still
+        available for callers whose evidence does not depend on
+        inspecting a real result after the fact."""
+        task_id = self._submit_and_route()
+        proposal = self.pipeline.submit_for_approval(
+            task_id, self.project, criteria_evidence={"creates agent_output.txt": True}
+        )
+        self.assertIsNotNone(proposal)
+        self.assertEqual(self.worktrees.get(task_id).status, WorktreeStatus.AWAITING_APPROVAL)
 
 
 class BypassPreventionTests(GovernedPipelineTestCase):

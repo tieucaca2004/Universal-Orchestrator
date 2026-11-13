@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from universal_orchestrator.core.engine import OrchestrationEngine
 from universal_orchestrator.core.models import ProjectProfile, TaskError
 from universal_orchestrator.errors import OrchestratorError
+from universal_orchestrator.execution.adapter import ExecutionResult
 from universal_orchestrator.execution.approval import IntegrationProposal
 from universal_orchestrator.execution.approval_manager import ApprovalGate
 from universal_orchestrator.execution.conflict_manager import ConflictManager
@@ -74,35 +75,29 @@ class GovernedPipeline:
     approvals: ApprovalGate
     quality: QualityGate
 
-    def submit_for_approval(
+    def dispatch(
         self,
         task_id: str,
         project: ProjectProfile,
         *,
         input_context: str = "",
         timeout_seconds: float = 60.0,
-        criteria_evidence: dict[str, bool] | None = None,
-    ) -> IntegrationProposal | None:
-        """Requires `engine.submit()` and `engine.route()` to have
-        already produced a `RoutingOutcome.SELECTED` decision for this
-        task — routing itself is unchanged and not duplicated here.
+    ) -> ExecutionResult:
+        """Steps 1-4 of the Founder-specified sequence only: acquire a
+        dedicated Worktree, dispatch the real Agent into it, and commit
+        whatever it produced. Returns the real `ExecutionResult` (also
+        already persisted by `engine.execute()`) so the caller —
+        Founder, a Reviewer-role agent, or an automated check — can
+        inspect the *actual* output before deciding on evidence.
 
-        Returns `None` when the task failed its own Quality Gate —
-        there is nothing to propose, so no `IntegrationProposal` is
-        built; the task is marked FAILED and its Worktree NEEDS_REVIEW.
-        Returns a built proposal even when Conflict Manager blocks it
-        (so Founder can see the conflict detail) — but its Worktree is
-        left NEEDS_REVIEW, not AWAITING_APPROVAL, and
-        `ApprovalGate.record_decision()` already refuses to approve a
-        blocked proposal (Milestone 6.3, unchanged)."""
-        task = self.engine.manager.get(task_id)
-
-        # -- 1-2: isolated Worktree per execution --------------------------
+        Evidence is never collected here and never before this method
+        returns — that was M6 remediation's Item 1 finding: evidence
+        can only honestly be evaluated after the real result exists.
+        `evaluate_and_propose` is the next, separate call."""
         handle = self.worktrees.acquire(project.project_id, task_id, project.repository_path)
         self.worktrees.transition(task_id, WorktreeStatus.EXECUTING)
         self.engine.manager.start(task_id)
 
-        # -- 3-4: dispatch the Agent into that exact Worktree ----------------
         try:
             result = self.engine.execute(
                 task_id,
@@ -125,12 +120,48 @@ class GovernedPipeline:
         # by design (ROADMAP.md §10.2), never on a working tree's
         # uncommitted contents.
         self._commit_worktree_changes(handle.path, task_id)
+        self.worktrees.transition(task_id, WorktreeStatus.QUALITY_CHECK)
+        return result
 
-        # -- 5: task-level Quality Gate --------------------------------------
+    def evaluate_and_propose(
+        self,
+        task_id: str,
+        project: ProjectProfile,
+        *,
+        criteria_evidence: dict[str, bool] | None = None,
+    ) -> IntegrationProposal | None:
+        """Steps 5-8. Requires `dispatch()` to have already run for this
+        exact task (its Worktree must be in `QUALITY_CHECK`) — refuses
+        otherwise, rather than silently evaluating against nothing.
+        Re-fetches the real, already-persisted `ExecutionResult` itself
+        (the same one `dispatch()` returned) — `criteria_evidence` is
+        the caller's real judgment of that real result, collected only
+        now, never before execution.
+
+        Returns `None` when the task failed its own Quality Gate —
+        there is nothing to propose, so no `IntegrationProposal` is
+        built; the task is marked FAILED and its Worktree NEEDS_REVIEW.
+        Returns a built proposal even when Conflict Manager blocks it
+        (so Founder can see the conflict detail) — but its Worktree is
+        left NEEDS_REVIEW, not AWAITING_APPROVAL, and
+        `ApprovalGate.record_decision()` already refuses to approve a
+        blocked proposal (Milestone 6.3, unchanged)."""
+        task = self.engine.manager.get(task_id)
+        handle = self.worktrees.get(task_id)
+        if handle.status is not WorktreeStatus.QUALITY_CHECK:
+            raise OrchestratorError(
+                f"task '{task_id}': call dispatch() before evaluate_and_propose() "
+                f"— Worktree is '{handle.status.value}', not QUALITY_CHECK"
+            )
+        results = self.engine.manager.get_execution_results(task_id)
+        if not results:
+            raise OrchestratorError(f"task '{task_id}' has no recorded ExecutionResult")
+        result = results[-1]
+
+        # -- 5: task-level Quality Gate, against the real result ------------
         quality_report = self.quality.evaluate_task(
             task.specification, result, criteria_evidence=criteria_evidence
         )
-        self.worktrees.transition(task_id, WorktreeStatus.QUALITY_CHECK)
 
         if quality_report.verdict is not QualityVerdict.PASS:
             self.engine.manager.fail(
@@ -162,6 +193,27 @@ class GovernedPipeline:
             self.worktrees.transition(task_id, WorktreeStatus.AWAITING_APPROVAL)
 
         return proposal
+
+    def submit_for_approval(
+        self,
+        task_id: str,
+        project: ProjectProfile,
+        *,
+        input_context: str = "",
+        timeout_seconds: float = 60.0,
+        criteria_evidence: dict[str, bool] | None = None,
+    ) -> IntegrationProposal | None:
+        """Convenience wrapper over `dispatch()` + `evaluate_and_propose()`
+        for callers whose evidence is deterministic/automated and does
+        not actually need to be collected after seeing the real result
+        (every existing automated test in this repository is such a
+        caller). **Not** the right call for a genuine human review of
+        a real Agent's real output — use `dispatch()` then
+        `evaluate_and_propose()` separately for that, so evidence is
+        collected strictly after execution, never before. Kept for
+        backward compatibility; contains no logic of its own."""
+        self.dispatch(task_id, project, input_context=input_context, timeout_seconds=timeout_seconds)
+        return self.evaluate_and_propose(task_id, project, criteria_evidence=criteria_evidence)
 
     def integrate_after_approval(
         self, task_id: str, project: ProjectProfile
