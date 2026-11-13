@@ -13,9 +13,12 @@ by absorbing or copying them.
 Milestone 5 — Hermes Agent Adapter and execution verification,
 registered alongside the Claude Code CLI Adapter (Milestone 4, plus its
 post-audit remediation) through the same `ExecutionAdapter` contract
-and `AdapterRegistry`. See [ARCHITECTURE.md](ARCHITECTURE.md) for the
-component map, the Founder-approved 8-milestone roadmap, and open
-architectural questions; [docs/TASK_LIFECYCLE.md](docs/TASK_LIFECYCLE.md)
+and `AdapterRegistry`. See [ROADMAP.md](ROADMAP.md) for the
+authoritative milestone status, M6–M8 plans, and the Orchestrator A /
+Orchestrator B distinction; [ARCHITECTURE.md](ARCHITECTURE.md) for the
+component map and the Appendix noting items still awaiting a Founder
+decision;
+[docs/TASK_LIFECYCLE.md](docs/TASK_LIFECYCLE.md)
 for the task state machine; [docs/REGISTRIES.md](docs/REGISTRIES.md) for
 the registry schemas; [docs/ROUTING.md](docs/ROUTING.md) for the routing
 algorithm; [docs/EXECUTION_CLAUDE_CODE.md](docs/EXECUTION_CLAUDE_CODE.md)
@@ -46,7 +49,8 @@ src/universal_orchestrator/
   execution/   execution adapter interface + ClaudeCodeAdapter +
                HermesAdapter (two real ones) + AdapterRegistry for
                future engines (DeepSeek Harness CLI — not installed,
-               not implemented; future RTX 3070 worker — M7)
+               not implemented; RTX 3070 is not a Worker Runtime and is
+               not in scope — see ROADMAP.md)
   approval/    approval gate for sensitive operations (a later milestone)
   audit/       structured logging (full audit trail in a later milestone)
   config/      configuration management
@@ -54,8 +58,10 @@ src/universal_orchestrator/
 ```
 
 Note: the Milestone 3 brief specified `src/orchestrator/...`; this
-repository has used `src/universal_orchestrator/...` since Milestone 1.
-See ARCHITECTURE.md's "Open architectural questions" for why that naming
+repository has used `src/universal_orchestrator/...` since Milestone 1
+(`pyproject.toml`'s `name = "universal-orchestrator"`; 32 files under
+`src/`/`tests/` import it; no `src/orchestrator/` directory exists).
+See [ARCHITECTURE.md](ARCHITECTURE.md)'s Appendix for why that naming
 was kept rather than mass-renamed.
 
 ## Running tests

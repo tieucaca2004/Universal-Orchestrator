@@ -11,8 +11,11 @@ Claude's behavior or from another Hermes version's documentation.
 
 Still `tieu`, the ASUS laptop — not the Intel NUC the approved
 architecture names as the central Orchestrator host. Hermes runs here
-as a Docker container, not on any dedicated Worker machine; the RTX
-3070 Desktop remains untouched and unconnected (M7 scope).
+as a Docker container, not on any dedicated machine. RTX 3070 hardware
+remains untouched, not integrated, and is **not a Worker Runtime** —
+see [ROADMAP.md](../ROADMAP.md) §7–§8 for the current, authoritative
+status (this replaces an earlier "(M7 scope)" framing that implied a
+Worker-Runtime relationship no longer assumed).
 
 ## Hermes installation (real, verified)
 
