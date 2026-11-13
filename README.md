@@ -11,7 +11,11 @@ by absorbing or copying them.
 ## Status
 
 Milestone 4 — Claude Code CLI Adapter and verified non-interactive
-execution. See [ARCHITECTURE.md](ARCHITECTURE.md) for the component map,
+execution, including the post-M4 audit remediation (security isolation
+hardening, executable pinning, execution-dispatch revalidation; see
+[docs/EXECUTION_CLAUDE_CODE.md](docs/EXECUTION_CLAUDE_CODE.md)'s
+"Security posture" table for exactly what changed). See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the component map,
 the Founder-approved 8-milestone roadmap, and open architectural
 questions; [docs/TASK_LIFECYCLE.md](docs/TASK_LIFECYCLE.md) for the task
 state machine; [docs/REGISTRIES.md](docs/REGISTRIES.md) for the registry

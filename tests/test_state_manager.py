@@ -298,6 +298,46 @@ class ExecutionResultPersistenceTests(StateManagerTestCase):
         self.assertIsNone(loaded.structured_output_valid)
         self.assertIsNone(loaded.verification_status)
 
+    def test_duplicate_execution_id_raises_typed_duplicate_error(self):
+        """Audit Finding E-2: a raw sqlite3.IntegrityError must never
+        surface here — it is translated the same way tasks.create()
+        already translates one."""
+        task = Task(title="t", project_id="proj_a")
+        self.state.create(task)
+        result = ExecutionResult(
+            execution_id="exec_dup", task_id=task.task_id, outcome=ExecutionOutcome.COMPLETED
+        )
+        self.state.save_execution_result(result)
+
+        with self.assertRaises(DuplicateError):
+            self.state.save_execution_result(result)
+
+    def test_duplicate_execution_result_does_not_corrupt_the_existing_row(self):
+        task = Task(title="t", project_id="proj_a")
+        self.state.create(task)
+        result = ExecutionResult(
+            execution_id="exec_dup",
+            task_id=task.task_id,
+            outcome=ExecutionOutcome.COMPLETED,
+            stdout="first",
+        )
+        self.state.save_execution_result(result)
+        try:
+            self.state.save_execution_result(
+                ExecutionResult(
+                    execution_id="exec_dup",
+                    task_id=task.task_id,
+                    outcome=ExecutionOutcome.FAILED,
+                    stdout="second",
+                )
+            )
+        except DuplicateError:
+            pass
+
+        loaded = self.state.get_execution_results(task.task_id)
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].stdout, "first")
+
 
 if __name__ == "__main__":
     unittest.main()

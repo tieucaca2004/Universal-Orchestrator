@@ -39,6 +39,34 @@ class DuplicateError(OrchestratorError):
         super().__init__(f"{kind} '{identifier}' already registered")
 
 
+class AgentNotEligibleError(OrchestratorError):
+    """Raised when the agent a RoutingDecision selected is no longer
+    AVAILABLE by the time execution is attempted — the decision has
+    gone stale since routing (M4 audit remediation, Finding F-1)."""
+
+    def __init__(self, agent_id: str, status: str) -> None:
+        self.agent_id = agent_id
+        self.status = status
+        super().__init__(
+            f"Agent '{agent_id}' is '{status}', not AVAILABLE; refusing to dispatch "
+            "a stale routing decision."
+        )
+
+
+class AdapterUnavailableError(OrchestratorError):
+    """Raised when `ExecutionAdapter.verify()` does not return AVAILABLE
+    immediately before dispatch — never assumed, always checked fresh
+    (M4 audit remediation, Finding B-1)."""
+
+    def __init__(self, provider_id: str, status: str) -> None:
+        self.provider_id = provider_id
+        self.status = status
+        super().__init__(
+            f"Adapter for provider '{provider_id}' reported '{status}', not "
+            "AVAILABLE; refusing to dispatch."
+        )
+
+
 class InvalidStateTransitionError(OrchestratorError):
     def __init__(self, entity: str, current: str, target: str) -> None:
         self.entity = entity

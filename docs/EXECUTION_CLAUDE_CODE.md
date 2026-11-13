@@ -31,6 +31,12 @@ Commands actually run, with their actual output, on this host:
 | Authentication check | `claude auth status` | `{"loggedIn": true, "authMethod": "oauth_token", "apiProvider": "firstParty"}` — no credential value, just status |
 | Installation health | `claude doctor` | version/commit/platform confirmed, "No installation issues found" |
 | Trust prompt behavior | `claude --help` | "The workspace trust dialog is skipped when Claude is run in non-interactive mode (via -p...). Only use this in directories you trust." |
+| Config isolation (safe mode) | `claude --help` (M4 audit remediation) | `--safe-mode`: "Start with all customizations (CLAUDE.md, skills, plugins, hooks, MCP servers, custom commands and agents, output styles, workflows, custom themes, keybindings, and more) disabled... Auth, model selection, built-in tools, and permissions work normally." |
+| MCP isolation | `claude --help` (M4 audit remediation) | `--strict-mcp-config`: "Only use MCP servers from --mcp-config, ignoring all other MCP configurations" |
+| Skills isolation | `claude --help` (M4 audit remediation) | `--disable-slash-commands`: "Disable all skills" |
+| Settings-source restriction | `claude --help` (M4 audit remediation) | `--setting-sources <sources>`: "Comma-separated list of setting sources to load (user, project, local)" — adapter uses `user` only |
+| Minimal mode — evaluated, rejected | `claude --help` (M4 audit remediation) | `--bare`: "...Anthropic auth is strictly ANTHROPIC_API_KEY or apiKeyHelper via --settings (OAuth and keychain are never read)..." — **incompatible with this host's OAuth authentication**, confirmed by this host's own `auth status` reporting `authMethod: oauth_token`; never used |
+| Restricted-environment auth check (real, free) | `subprocess.run(["claude","auth","status"], env={"HOME","PATH","LANG"})` (M4 audit remediation) | exit `0`, `loggedIn: true`, `authMethod: oauth_token` — confirms the environment allowlist does not break authentication on this host |
 
 **Real argument-order bug found and worked around:** `--tools` is
 variadic (`--tools <tools...>`). Passing the prompt *after* `--tools ""`
@@ -68,28 +74,37 @@ unnecessary paid call.
 
 ## Security posture
 
-`PermissionMode` currently defines exactly one value, `READ_ONLY`,
-implemented as `--tools ""`. This was chosen over an allow-list such as
-`--allowedTools Read,Grep,Glob` because this repository has not verified
-this CLI version's exact tool-name list, and a wrong guess could under-
-or over-restrict; `--tools ""` is the one option directly and
-unambiguously documented by `--help`. Consequences, all verified by the
-real smoke test above:
+**Revised by the M4 audit remediation.** An independent audit (Finding
+C-1) found that the original `--tools ""`-only policy was described as
+"read-only execution" without distinguishing *which* isolation boundary
+that phrase actually covers. The six boundaries below are now handled,
+documented, and tested separately — conflating them is exactly the
+mistake the audit flagged, so this section is deliberately explicit
+about which ones this adapter enforces and which it does not.
 
-- Claude cannot read, write, or edit any file — including the task's
-  own project repository. Planner/Architect/Reviewer roles in this
-  milestone can only reason from `ExecutionRequest.input_context` (text
-  the caller supplies), not from browsing the repository. Broader read
-  access is deferred to a future milestone once the real tool-name list
-  for this CLI version is verified.
+| Boundary | Enforced? | How |
+|---|---|---|
+| **Built-in tool restriction** | **Yes** | `--tools ""` — every built-in tool (Read, Write, Edit, Bash, ...) disabled. Unchanged from the original M4 implementation. |
+| **Plugin / hook / MCP restriction** | **Yes, added in remediation** | `--safe-mode` (disables CLAUDE.md, skills, plugins, hooks, MCP servers, custom commands/agents, output styles, workflows, themes) + `--strict-mcp-config` (forces zero MCP servers independently of `--safe-mode`) + `--disable-slash-commands` (disables skills independently too) + `--setting-sources user` (excludes project/local settings files — e.g. anything a task's `working_directory` might itself contain). All four verified present in `--help` before every real execution (`verify()`'s `_check_supported_options`); `execute()` fails closed (`UNSUPPORTED`) if a CLI version lacks any of them. |
+| **Filesystem isolation** | **No** | Not a sandbox, container, or chroot. Nothing here stops the `claude` process itself (as opposed to Claude's own tool use) from touching the filesystem if it chose to — this adapter relies entirely on tool/plugin/hook/MCP restriction above, not OS-level filesystem confinement. Real project execution still needs Git Worktree isolation (M6). |
+| **Process isolation** | **Partial** | `start_new_session=True` gives the invocation its own process group, so timeout/cancellation can terminate it and any children together (`os.killpg`). This is grouping for clean teardown, not a security sandbox — it does not prevent the process from spawning something outside that group. |
+| **Network isolation** | **No** | The process can still reach the network (it needs to, to reach the Anthropic API). Nothing in this adapter restricts outbound network access. |
+| **Environment restriction** | **Yes, added in remediation** | `_build_subprocess_env()` passes an explicit allowlist (`HOME, PATH, LANG, LC_ALL, TERM, TMPDIR`) to every subprocess call this adapter makes — never the full parent environment. Empirically verified: `claude auth status` with only this allowlist still reports `loggedIn: true` on this host (OAuth authentication is settings-file-driven, read by the `claude` process itself from `~/.claude`, not dependent on any credential being in this process's environment). A host authenticating via an exported `ANTHROPIC_API_KEY` or similar shell variable would need that name added to the allowlist — `verify()` will correctly report `UNAUTHENTICATED` rather than silently misbehaving if it's missing, never a false `AVAILABLE`. |
+
+Additional, unchanged-by-remediation guarantees, all still verified:
+
 - `execute()` fails closed (`ExecutionOutcome.ERROR`,
   `error_classification="unsupported_permission_mode"`) for any
   `permission_mode` other than `READ_ONLY` — there is no silent
   fallback to a more permissive mode.
-- `--dangerously-skip-permissions` and
-  `--allow-dangerously-skip-permissions` are never constructed into any
-  command, anywhere in this module — verified by
-  `SecurityTests.test_dangerous_permission_bypass_flags_are_never_used`.
+- `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`,
+  and **`--bare`** are never constructed into any command, anywhere in
+  this module. `--bare` specifically was evaluated and rejected: its own
+  `--help` text states "Anthropic auth is strictly `ANTHROPIC_API_KEY`
+  or `apiKeyHelper`... OAuth and keychain are never read" — this host
+  authenticates via OAuth, so `--bare` would have broken authentication
+  outright. A real, verified incompatibility, not a guess — see
+  `SecurityTests.test_bare_flag_is_never_used`.
 - The prompt is always passed as a single `argv` element to
   `subprocess.Popen` (never through a shell), so shell metacharacters in
   a task's input cannot be interpreted — verified with a payload
@@ -100,7 +115,25 @@ real smoke test above:
   `AuthenticationTests.test_verify_never_exposes_raw_auth_json`.
 - No API key is ever placed in a command-line argument — authentication
   is entirely the pre-existing `claude auth login` state on this host;
-  this adapter never reads, writes, or overwrites that configuration.
+  this adapter never reads, writes, or overwrites that configuration,
+  and never reads `~/.claude/settings.json` or any other credential-
+  bearing file directly.
+
+### Executable resolution (pinning)
+
+Also added in remediation, addressing a separate audit finding: a bare
+executable name (`"claude"`, the default) is resolved via `PATH`
+**exactly once per adapter instance** — on whichever of `verify()` or
+`execute()` runs first — and the resulting absolute path is pinned
+(`self._resolved_path`). Every later call re-validates that the *same*
+path still exists and is still executable; it never searches `PATH`
+again. This closes the window where a `PATH` change between `verify()`
+and `execute()` could silently route execution to a different binary.
+If the pinned path disappears, resolution fails closed
+(`UNAVAILABLE`/`executable_not_found`) rather than falling back to a
+fresh `PATH` search. This does **not** verify binary integrity (e.g., a
+checksum) — only existence and the executable bit; that limitation is
+intentional, not an oversight, and is unchanged from before.
 
 ## Execution lifecycle
 
@@ -126,17 +159,42 @@ with the CLI's own `is_error: true` field is still `FAILED`
 ran to a normal finish with no error signal"), never a claim that the
 task's actual objective was met.
 
+**`verify()` runs again inside `execute()`, every time** (remediation,
+Finding B-1 at the adapter layer — the Engine-layer fix is below). Before
+ever constructing a command, `execute()` calls `self.verify()` and
+populates `ExecutionResult.verification_status` with whatever it
+returns; anything other than `AVAILABLE` short-circuits to
+`ExecutionOutcome.ERROR` with a matching `error_classification`
+(`adapter_unavailable`/`adapter_unauthenticated`/`adapter_unsupported`/
+`adapter_verification_error`) and never constructs a command at all.
+This never invents a successful verification — the status recorded is
+always the actual, fresh result of that call.
+
+**Output truncation is byte-accurate** (remediation; previously
+character-count slicing, which could keep up to 2x the intended bytes
+for non-ASCII output or silently undercount). `stdout`/`stderr` are each
+bounded independently to `policy.max_output_bytes` by encoding to UTF-8,
+slicing the real byte string, and decoding back with a partial trailing
+multi-byte sequence dropped rather than raising or emitting replacement
+characters — see `_truncate_utf8_bytes` and
+`OutputTruncationTests`.
+
 **Duplicate-execution protection**: re-calling `execute()` with an
 `execution_id` already seen returns the cached first result, never
 re-running — including when that first result was `TIMED_OUT` (an
 uncertain outcome is still never silently retried). This guarantee holds
 for the lifetime of one `ClaudeCodeAdapter` instance only — it is **not**
-crash-persistent. A process restart loses the cache; the Task Manager's
-own `record_execution_result`/`get_execution_results` (SQLite-backed)
-is the durable record, and nothing in this milestone automatically
+crash-persistent. A process restart loses the cache; `StateManager.
+save_execution_result` now raises `errors.DuplicateError` on a repeated
+`execution_id` (remediation, Finding E-2 — previously a raw
+`sqlite3.IntegrityError` would have surfaced), matching how `tasks.
+create()` already behaves. Nothing in this milestone automatically
 retries a task found with an uncertain prior execution result on
 restart (consistent with `TaskManager.recover()`'s existing rule for
-`INTERRUPTED` tasks).
+`INTERRUPTED` tasks), and this remediation deliberately does not add a
+database-backed check to prevent a *fresh* `execute()` call (with a new
+`execution_id`) from re-running the same task after a restart — doing
+so would be a new persistence architecture, out of scope here.
 
 **Cancellation**: `cancel(execution_id)` sends the same
 graceful-then-forceful process-group termination used for timeouts.
@@ -148,14 +206,27 @@ if nothing matching is currently running.
 
 `OrchestrationEngine.execute(task_id, working_directory, ...)`:
 
-1. Requires `self.adapters` (an `AdapterRegistry`) to be configured —
-   `RuntimeError` otherwise.
+1. Requires `self.adapters`, `self.agents`, **and `self.providers`**
+   (an `AdapterRegistry`, `AgentRegistry`, `ProviderRegistry`) all
+   configured — `RuntimeError` otherwise. `providers` is new in the
+   remediation; `agents` graduated from optional to required for the
+   same reason.
 2. Fetches the task's most recent routing decision. No decision, or a
    `NO_ELIGIBLE_AGENT` decision → `OrchestratorError`. Routing is never
    bypassed.
-3. Looks up the `ExecutionAdapter` for `decision.selected_provider_id`
-   via the Adapter Registry, and the agent's role via
-   `AgentRegistry` (if wired).
+3. **Revalidates, every time** (remediation, Findings B-1/F-1 — a
+   `RoutingDecision` can go stale between `route()` and `execute()`):
+   - the selected agent's current `status` must be `AgentStatus.
+     AVAILABLE` — else `errors.AgentNotEligibleError`;
+   - the selected provider must still be `verified` and `AVAILABLE` —
+     else `errors.ProviderNotVerifiedError` (reused rather than adding
+     a near-duplicate type);
+   - the selected adapter's own `verify()` must return
+     `VerificationStatus.AVAILABLE` right now — else
+     `errors.AdapterUnavailableError`.
+   Any failure raises before an `ExecutionRequest` is even built —
+   `adapter.execute()` is never called (verified by
+   `DispatchRevalidationTests.test_refused_dispatch_never_calls_adapter_execute`).
 4. Builds an `ExecutionRequest` carrying `task_id`, `project_id`,
    `agent_id`, `provider_id`, `agent_role`, the task's
    `TaskSpecification`, and `decision.decision_id` as the correlation id
@@ -215,6 +286,8 @@ smoke test, before any code is written.
 
 ## Known limitations
 
+Unchanged by the remediation:
+
 - Only zero-tool (`--tools ""`) execution is implemented. No read-access
   policy, no write policy, no Git Worktree integration.
 - `execute()` is synchronous (blocks the calling thread for the
@@ -230,4 +303,28 @@ smoke test, before any code is written.
 - Execution-result caching for duplicate protection is in-memory only
   (see "Duplicate-execution protection" above) — not durable across a
   process restart; the SQLite `execution_results` table is the durable
-  record but is not itself consulted to prevent a re-run.
+  record but is not itself consulted to prevent a *fresh* `execute()`
+  call from re-running the same task after a restart.
+
+New, from the remediation itself — residual risks the Founder has
+acknowledged rather than this document silently papering over:
+
+- **Filesystem, process, and network isolation remain unenforced** (see
+  the "Security posture" table). The plugin/MCP/hook restriction added
+  this round closes a real gap, but it is still CLI configuration, not
+  a sandbox, container, or network policy. Real project execution
+  still requires Git Worktree isolation (M6).
+- **The exposed OAuth token from the audit was not rotated as part of
+  this remediation** — the Founder directive explicitly deferred that
+  decision; it remains an acknowledged residual risk outside this
+  codebase's scope to fix.
+- **Executable pinning checks existence and the executable bit only**,
+  never binary integrity (no checksum/signature verification). A
+  pinned path that is replaced in-place with different content between
+  checks would not be detected.
+- **Process-group termination has not been verified against the real
+  Claude CLI's own child-process behavior** (e.g., any MCP server
+  process it might start before `--strict-mcp-config` takes effect, or
+  before this remediation at all) — only against single-process fake
+  executables in the automated tests, per the audit's own no-paid-call
+  constraint on real verification.

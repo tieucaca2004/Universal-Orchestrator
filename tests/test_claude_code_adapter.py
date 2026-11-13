@@ -11,6 +11,7 @@ import stat
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +29,8 @@ _FAKE_CLAUDE_SOURCE = textwrap.dedent(
     """\
     #!/usr/bin/env python3
     import json
+    import os
+    import signal
     import sys
     import time
 
@@ -38,7 +41,10 @@ _FAKE_CLAUDE_SOURCE = textwrap.dedent(
         sys.exit(0)
 
     if args == ["--help"]:
-        print("-p, --print\\n--output-format\\n--tools\\n--no-session-persistence\\n")
+        print(
+            "-p, --print\\n--output-format\\n--tools\\n--no-session-persistence\\n"
+            "--safe-mode\\n--strict-mcp-config\\n--disable-slash-commands\\n--setting-sources\\n"
+        )
         sys.exit(0)
 
     if len(args) >= 2 and args[0:2] == ["auth", "status"]:
@@ -47,7 +53,8 @@ _FAKE_CLAUDE_SOURCE = textwrap.dedent(
 
     # Execution path: argv[0] is always the prompt (adapter puts it first).
     prompt = args[0] if args else ""
-    print(json.dumps(args), file=sys.stderr)  # lets tests inspect the exact command
+    print(json.dumps(args), file=sys.stderr)  # line 1: exact command, for tests
+    print(json.dumps(sorted(os.environ.keys())), file=sys.stderr)  # line 2: env keys only
 
     if prompt.startswith("TRIGGER_NONZERO"):
         print(json.dumps({"is_error": False, "result": "partial"}))
@@ -65,8 +72,16 @@ _FAKE_CLAUDE_SOURCE = textwrap.dedent(
         time.sleep(seconds)
         print(json.dumps({"is_error": False, "result": "late"}))
         sys.exit(0)
+    elif prompt.startswith("TRIGGER_IGNORE_SIGTERM"):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(30)
+        sys.exit(0)
     elif prompt.startswith("TRIGGER_CRASH"):
         sys.exit(139)
+    elif prompt.startswith("TRIGGER_UNICODE"):
+        count = int(prompt.split(":", 1)[1]) if ":" in prompt else 100
+        print(json.dumps({"is_error": False, "result": "x" + ("\\u00e9" * count)}))
+        sys.exit(0)
     else:
         print(json.dumps({"is_error": False, "result": f"OK:{prompt}"}))
         sys.exit(0)
@@ -175,7 +190,10 @@ class AuthenticationTests(AdapterTestCase):
             if sys.argv[1:] == ["--version"]:
                 print("9.9.9"); sys.exit(0)
             if sys.argv[1:] == ["--help"]:
-                print("-p, --print --output-format --tools --no-session-persistence"); sys.exit(0)
+                print(
+                    "-p, --print --output-format --tools --no-session-persistence "
+                    "--safe-mode --strict-mcp-config --disable-slash-commands --setting-sources"
+                ); sys.exit(0)
             sys.exit(1)
             """
         )
@@ -250,11 +268,15 @@ class ExecutionTests(AdapterTestCase):
         self.assertEqual(result.exit_code, 139)
 
     def test_missing_executable_at_execute_time(self):
+        # execute() now runs verify() first (fail closed), which reports
+        # UNAVAILABLE for a missing executable before ever reaching a
+        # bare "not found" check — see claude_code.py's execute().
         adapter = ClaudeCodeAdapter(executable=str(self.tmp_path / "gone"))
         result = adapter.execute(self._request("hello"))
 
         self.assertIs(result.outcome, ExecutionOutcome.ERROR)
-        self.assertEqual(result.error_classification, "executable_not_found")
+        self.assertEqual(result.error_classification, "adapter_unavailable")
+        self.assertIs(result.verification_status, VerificationStatus.UNAVAILABLE)
 
     def test_permission_mode_other_than_read_only_fails_closed(self):
         adapter = self._fake_adapter()
@@ -350,6 +372,30 @@ class SecurityTests(AdapterTestCase):
 
         self.assertIn("--no-session-persistence", argv)
 
+    def test_configuration_isolation_flags_are_present(self):
+        """Audit remediation, Finding C-1: plugins/hooks/MCP/skills are
+        disabled, and only user-level settings load."""
+        adapter = self._fake_adapter()
+        result = adapter.execute(self._request("hello"))
+        argv = json.loads(result.stderr.splitlines()[0])
+
+        self.assertIn("--safe-mode", argv)
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertIn("--disable-slash-commands", argv)
+        self.assertIn("--setting-sources", argv)
+        self.assertEqual(argv[argv.index("--setting-sources") + 1], "user")
+
+    def test_bare_flag_is_never_used(self):
+        """`--bare` is deliberately rejected: its own --help text says it
+        reads auth strictly from ANTHROPIC_API_KEY/apiKeyHelper and never
+        from OAuth or keychain, which would break authentication on an
+        OAuth-authenticated host — see the module docstring."""
+        adapter = self._fake_adapter()
+        result = adapter.execute(self._request("hello"))
+        argv = json.loads(result.stderr.splitlines()[0])
+
+        self.assertNotIn("--bare", argv)
+
 
 class ExecutionTrackingTests(AdapterTestCase):
     def test_each_request_has_a_unique_execution_id_by_default(self):
@@ -392,6 +438,150 @@ class ExecutionTrackingTests(AdapterTestCase):
 
         self.assertIs(second, first)
         self.assertLess(elapsed, 0.2)  # returned from cache, did not re-run and re-wait
+
+
+class EnvironmentAllowlistTests(AdapterTestCase):
+    def test_unrelated_environment_variables_are_not_inherited(self):
+        marker_key = "UO_TEST_UNRELATED_SECRET_12345"
+        os.environ[marker_key] = "should-not-be-inherited"
+        try:
+            adapter = self._fake_adapter()
+            result = adapter.execute(self._request("hello"))
+        finally:
+            del os.environ[marker_key]
+
+        child_env_keys = json.loads(result.stderr.splitlines()[1])
+        self.assertNotIn(marker_key, child_env_keys)
+
+    def test_allowlisted_variables_that_are_set_are_inherited(self):
+        os.environ["HOME"] = os.environ.get("HOME", "/tmp")
+        adapter = self._fake_adapter()
+        result = adapter.execute(self._request("hello"))
+
+        child_env_keys = json.loads(result.stderr.splitlines()[1])
+        self.assertIn("HOME", child_env_keys)
+        self.assertIn("PATH", child_env_keys)
+
+    def test_version_help_and_auth_checks_also_use_the_restricted_environment(self):
+        marker_key = "UO_TEST_UNRELATED_SECRET_FOR_VERIFY"
+        os.environ[marker_key] = "leak-check"
+        captured_envs = []
+        real_run = subprocess.run
+
+        def spying_run(*args, **kwargs):
+            captured_envs.append(kwargs.get("env"))
+            return real_run(*args, **kwargs)
+
+        try:
+            executable = _write_fake_executable(self.tmp_path, _FAKE_CLAUDE_SOURCE)
+            adapter = ClaudeCodeAdapter(executable=executable, run=spying_run)
+            adapter.verify()
+        finally:
+            del os.environ[marker_key]
+
+        self.assertTrue(captured_envs)
+        for env in captured_envs:
+            self.assertIsNotNone(env)
+            self.assertNotIn(marker_key, env)
+
+
+class ExecutablePinningTests(AdapterTestCase):
+    def test_path_change_after_verify_does_not_change_which_binary_execute_uses(self):
+        original = _write_fake_executable(self.tmp_path, _FAKE_CLAUDE_SOURCE, name="claude")
+        bin_dir = original.rsplit("/", 1)[0]
+
+        adapter = ClaudeCodeAdapter(executable="claude", run=subprocess.run)
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = bin_dir + os.pathsep + old_path
+        try:
+            self.assertIs(adapter.verify(), VerificationStatus.AVAILABLE)
+            pinned_path = adapter._resolved_path
+            self.assertEqual(pinned_path, original)
+
+            # Put a DIFFERENT fake "claude" earlier on PATH, simulating a
+            # PATH change / hijack attempt after verify() already ran.
+            hijack_dir = self.tmp_path / "hijack"
+            hijack_dir.mkdir()
+            hijack_path = _write_fake_executable(hijack_dir, _UNSUPPORTED_CLAUDE_SOURCE, name="claude")
+            os.environ["PATH"] = str(hijack_dir) + os.pathsep + bin_dir + os.pathsep + old_path
+
+            result = adapter.execute(self._request("hello"))
+        finally:
+            os.environ["PATH"] = old_path
+
+        # Still ran the originally pinned binary, not the newly-PATH-shadowing one.
+        self.assertIs(result.outcome, ExecutionOutcome.COMPLETED)
+        self.assertEqual(adapter._resolved_path, pinned_path)
+
+    def test_pinned_path_disappearing_fails_closed_without_researching_path(self):
+        executable = _write_fake_executable(self.tmp_path, _FAKE_CLAUDE_SOURCE)
+        adapter = ClaudeCodeAdapter(executable=executable)
+        self.assertIs(adapter.verify(), VerificationStatus.AVAILABLE)
+
+        os.remove(executable)
+
+        self.assertIs(adapter.verify(), VerificationStatus.UNAVAILABLE)
+        self.assertIsNone(adapter._resolved_path)
+
+
+class OutputTruncationTests(AdapterTestCase):
+    def test_ascii_output_under_the_limit_is_untouched(self):
+        adapter = self._fake_adapter()
+        result = adapter.execute(self._request("hello", policy=ExecutionPolicy(max_output_bytes=65536)))
+        self.assertEqual(result.structured_output["result"], "OK:hello")
+
+    def test_output_is_bounded_to_the_exact_byte_limit_not_character_count(self):
+        # Each "é" is 2 bytes in UTF-8; char-count slicing would keep
+        # twice as many bytes as a byte-accurate bound should.
+        adapter = self._fake_adapter()
+        result = adapter.execute(
+            self._request("TRIGGER_UNICODE:500", policy=ExecutionPolicy(max_output_bytes=100))
+        )
+
+        self.assertLessEqual(len(result.stdout.encode("utf-8")), 100)
+        # No UnicodeDecodeError was raised constructing `result.stdout`
+        # (it is already a valid `str`); re-encoding must also succeed.
+        result.stdout.encode("utf-8")
+
+    def test_stderr_is_truncated_independently_of_stdout(self):
+        adapter = self._fake_adapter()
+        result = adapter.execute(
+            self._request("hello", policy=ExecutionPolicy(max_output_bytes=20))
+        )
+
+        self.assertLessEqual(len(result.stderr.encode("utf-8")), 20)
+        self.assertLessEqual(len(result.stdout.encode("utf-8")), 20)
+        result.stderr.encode("utf-8")
+
+
+class SignalTerminationTests(AdapterTestCase):
+    def test_process_ignoring_sigterm_is_escalated_to_sigkill(self):
+        adapter = self._fake_adapter()
+        start = time.monotonic()
+        result = adapter.execute(self._request("TRIGGER_IGNORE_SIGTERM", timeout_seconds=0.5))
+        elapsed = time.monotonic() - start
+
+        self.assertIs(result.outcome, ExecutionOutcome.TIMED_OUT)
+        # Must have gone through the full SIGTERM grace period before
+        # SIGKILL finally stopped it — proves escalation actually ran,
+        # not just that TimeoutExpired was caught.
+        self.assertGreaterEqual(elapsed, 3.0)
+        self.assertLess(elapsed, 10.0)
+
+
+class VerificationStatusPopulationTests(AdapterTestCase):
+    def test_successful_execution_carries_the_available_status(self):
+        adapter = self._fake_adapter()
+        result = adapter.execute(self._request("hello"))
+        self.assertIs(result.verification_status, VerificationStatus.AVAILABLE)
+
+    def test_unauthenticated_adapter_refuses_to_execute_with_that_status(self):
+        adapter = self._fake_adapter(_UNAUTHENTICATED_CLAUDE_SOURCE)
+        result = adapter.execute(self._request("hello"))
+
+        self.assertIs(result.outcome, ExecutionOutcome.ERROR)
+        self.assertIs(result.verification_status, VerificationStatus.UNAUTHENTICATED)
+        self.assertEqual(result.error_classification, "adapter_unauthenticated")
 
 
 if __name__ == "__main__":

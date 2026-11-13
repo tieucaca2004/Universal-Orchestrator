@@ -225,36 +225,41 @@ class StateManager:
     # -- execution results -----------------------------------------------------
 
     def save_execution_result(self, result: ExecutionResult) -> None:
-        with self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO execution_results (
-                    execution_id, task_id, outcome, exit_code, stdout, stderr,
-                    started_at, ended_at, duration_seconds, cli_version,
-                    output_format, structured_output, structured_output_valid,
-                    verification_status, error_classification
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    result.execution_id,
-                    result.task_id,
-                    result.outcome.value,
-                    result.exit_code,
-                    result.stdout,
-                    result.stderr,
-                    result.started_at.isoformat() if result.started_at else None,
-                    result.ended_at.isoformat() if result.ended_at else None,
-                    result.duration_seconds,
-                    result.cli_version,
-                    result.output_format,
-                    json.dumps(result.structured_output)
-                    if result.structured_output is not None
-                    else None,
-                    None if result.structured_output_valid is None else int(result.structured_output_valid),
-                    result.verification_status.value if result.verification_status else None,
-                    result.error_classification,
-                ),
-            )
+        """Raises `errors.DuplicateError` on a repeated `execution_id` —
+        the same `sqlite3.IntegrityError` -> typed-error translation
+        `create()` already does for tasks (audit Finding E-2)."""
+        params = (
+            result.execution_id,
+            result.task_id,
+            result.outcome.value,
+            result.exit_code,
+            result.stdout,
+            result.stderr,
+            result.started_at.isoformat() if result.started_at else None,
+            result.ended_at.isoformat() if result.ended_at else None,
+            result.duration_seconds,
+            result.cli_version,
+            result.output_format,
+            json.dumps(result.structured_output) if result.structured_output is not None else None,
+            None if result.structured_output_valid is None else int(result.structured_output_valid),
+            result.verification_status.value if result.verification_status else None,
+            result.error_classification,
+        )
+        try:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO execution_results (
+                        execution_id, task_id, outcome, exit_code, stdout, stderr,
+                        started_at, ended_at, duration_seconds, cli_version,
+                        output_format, structured_output, structured_output_valid,
+                        verification_status, error_classification
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    params,
+                )
+        except sqlite3.IntegrityError as exc:
+            raise DuplicateError("ExecutionResult", result.execution_id) from exc
 
     def get_execution_results(self, task_id: str) -> list[ExecutionResult]:
         cursor = self._conn.execute(

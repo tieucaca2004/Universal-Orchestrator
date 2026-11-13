@@ -15,7 +15,13 @@ from universal_orchestrator.core.models import (
     TaskStatus,
 )
 from universal_orchestrator.core.state import StateManager
-from universal_orchestrator.errors import NotFoundError, OrchestratorError
+from universal_orchestrator.errors import (
+    AdapterUnavailableError,
+    AgentNotEligibleError,
+    NotFoundError,
+    OrchestratorError,
+    ProviderNotVerifiedError,
+)
 from universal_orchestrator.execution.adapter import (
     ExecutionAdapter,
     ExecutionOutcome,
@@ -32,12 +38,19 @@ from universal_orchestrator.routing.router import AgentRouter
 class _FakeExecutionAdapter(ExecutionAdapter):
     """Deterministic test double — never a real Claude CLI call."""
 
-    def __init__(self, outcome: ExecutionOutcome = ExecutionOutcome.COMPLETED):
+    def __init__(
+        self,
+        outcome: ExecutionOutcome = ExecutionOutcome.COMPLETED,
+        verify_status: VerificationStatus = VerificationStatus.AVAILABLE,
+    ):
         self._outcome = outcome
+        self._verify_status = verify_status
         self.received_requests = []
+        self.verify_call_count = 0
 
     def verify(self):
-        return VerificationStatus.AVAILABLE
+        self.verify_call_count += 1
+        return self._verify_status
 
     def execute(self, request):
         self.received_requests.append(request)
@@ -278,7 +291,11 @@ class ExecutionIntegrationTests(EngineTestCase):
         self._available_agent(provider_id=provider.provider_id)
         adapters.register(provider.provider_id, fake_adapter)
         engine = OrchestrationEngine.bootstrap(
-            self.state, router=router, adapters=adapters, agents=self.agents
+            self.state,
+            router=router,
+            adapters=adapters,
+            agents=self.agents,
+            providers=self.providers,
         )
         return engine, provider
 
@@ -309,7 +326,13 @@ class ExecutionIntegrationTests(EngineTestCase):
         fake_adapter = _FakeExecutionAdapter()
         router = AgentRouter(self.agents, self.providers)  # no agents registered
         adapters = AdapterRegistry()
-        engine = OrchestrationEngine.bootstrap(self.state, router=router, adapters=adapters)
+        engine = OrchestrationEngine.bootstrap(
+            self.state,
+            router=router,
+            adapters=adapters,
+            agents=self.agents,
+            providers=self.providers,
+        )
         profile = self._registered_profile()
         task = engine.submit(self._request(), profile)
         engine.route(task.task_id, profile)
@@ -352,6 +375,132 @@ class ExecutionIntegrationTests(EngineTestCase):
 
         self.assertIs(result.outcome, ExecutionOutcome.FAILED)
         self.assertIs(engine.manager.get(task.task_id).status, status_before)
+
+
+class DispatchRevalidationTests(ExecutionIntegrationTests):
+    """M4 audit remediation, Findings B-1/F-1: a RoutingDecision can go
+    stale between route() and execute(). Reuses ExecutionIntegrationTests'
+    fixtures (_wired_engine, _registered_profile, etc.) via inheritance."""
+
+    def _routed_task(self, fake_adapter):
+        engine, provider = self._wired_engine(fake_adapter)
+        profile = self._registered_profile()
+        task = engine.submit(self._request(), profile)
+        decision = engine.route(task.task_id, profile)
+        return engine, profile, task, decision, provider
+
+    def test_agent_disabled_after_routing_is_refused(self):
+        engine, profile, task, _decision, _provider = self._routed_task(_FakeExecutionAdapter())
+        agent_id = engine.manager.get_routing_decisions(task.task_id)[-1].selected_agent_id
+        self.agents.set_status(agent_id, AgentStatus.DISABLED)
+
+        with self.assertRaises(AgentNotEligibleError):
+            engine.execute(task.task_id, working_directory=self._sandbox.name)
+
+    def test_agent_offline_after_routing_is_refused(self):
+        engine, profile, task, _decision, _provider = self._routed_task(_FakeExecutionAdapter())
+        agent_id = engine.manager.get_routing_decisions(task.task_id)[-1].selected_agent_id
+        self.agents.set_status(agent_id, AgentStatus.OFFLINE)
+
+        with self.assertRaises(AgentNotEligibleError):
+            engine.execute(task.task_id, working_directory=self._sandbox.name)
+
+    def test_provider_unavailable_after_routing_is_refused(self):
+        engine, profile, task, _decision, provider = self._routed_task(_FakeExecutionAdapter())
+        self.providers.set_status(provider.provider_id, ProviderStatus.UNAVAILABLE)
+
+        with self.assertRaises(ProviderNotVerifiedError):
+            engine.execute(task.task_id, working_directory=self._sandbox.name)
+
+    def test_provider_unverified_after_routing_is_refused(self):
+        engine, profile, task, _decision, provider = self._routed_task(_FakeExecutionAdapter())
+        self.providers.set_verified(provider.provider_id, False)
+
+        with self.assertRaises(ProviderNotVerifiedError):
+            engine.execute(task.task_id, working_directory=self._sandbox.name)
+
+    def test_adapter_verification_unavailable_is_refused(self):
+        fake_adapter = _FakeExecutionAdapter(verify_status=VerificationStatus.UNAVAILABLE)
+        engine, profile, task, _decision, _provider = self._routed_task(fake_adapter)
+
+        with self.assertRaises(AdapterUnavailableError):
+            engine.execute(task.task_id, working_directory=self._sandbox.name)
+
+    def test_adapter_verification_unauthenticated_is_refused(self):
+        fake_adapter = _FakeExecutionAdapter(verify_status=VerificationStatus.UNAUTHENTICATED)
+        engine, profile, task, _decision, _provider = self._routed_task(fake_adapter)
+
+        with self.assertRaises(AdapterUnavailableError):
+            engine.execute(task.task_id, working_directory=self._sandbox.name)
+
+    def test_adapter_verification_error_is_refused(self):
+        fake_adapter = _FakeExecutionAdapter(verify_status=VerificationStatus.ERROR)
+        engine, profile, task, _decision, _provider = self._routed_task(fake_adapter)
+
+        with self.assertRaises(AdapterUnavailableError):
+            engine.execute(task.task_id, working_directory=self._sandbox.name)
+
+    def test_successful_verification_is_followed_by_successful_execution(self):
+        fake_adapter = _FakeExecutionAdapter(
+            ExecutionOutcome.COMPLETED, verify_status=VerificationStatus.AVAILABLE
+        )
+        engine, profile, task, _decision, _provider = self._routed_task(fake_adapter)
+
+        result = engine.execute(task.task_id, working_directory=self._sandbox.name)
+
+        self.assertIs(result.outcome, ExecutionOutcome.COMPLETED)
+        self.assertGreaterEqual(fake_adapter.verify_call_count, 1)
+
+    def test_refused_dispatch_never_calls_adapter_execute(self):
+        fake_adapter = _FakeExecutionAdapter(verify_status=VerificationStatus.UNAVAILABLE)
+        engine, profile, task, _decision, _provider = self._routed_task(fake_adapter)
+
+        with self.assertRaises(AdapterUnavailableError):
+            engine.execute(task.task_id, working_directory=self._sandbox.name)
+
+        self.assertEqual(fake_adapter.received_requests, [])
+
+
+class MultiAdapterDispatchTests(ExecutionIntegrationTests):
+    """Two different ExecutionAdapter implementations registered at
+    once, dispatched correctly by provider_id — proves the Engine
+    routes to whichever adapter the RoutingDecision actually selected,
+    not merely the only one that happens to be registered."""
+
+    def test_engine_dispatches_to_the_correct_adapter_among_several(self):
+        provider_a = self._verified_provider(name="anthropic")
+        provider_b = self._verified_provider(name="future-engine")
+        agent_a = self._available_agent(name="agent-a", provider_id=provider_a.provider_id)
+        agent_b = self._available_agent(name="agent-b", provider_id=provider_b.provider_id)
+        # Make agent_b deterministically ineligible so routing always
+        # selects agent_a regardless of random agent_id tie-break order.
+        self.agents.set_status(agent_b.agent_id, AgentStatus.OFFLINE)
+
+        adapter_a = _FakeExecutionAdapter(ExecutionOutcome.COMPLETED)
+        adapter_b = _FakeExecutionAdapter(ExecutionOutcome.FAILED)
+        adapters = AdapterRegistry()
+        adapters.register(provider_a.provider_id, adapter_a)
+        adapters.register(provider_b.provider_id, adapter_b)
+
+        router = AgentRouter(self.agents, self.providers)
+        engine = OrchestrationEngine.bootstrap(
+            self.state,
+            router=router,
+            adapters=adapters,
+            agents=self.agents,
+            providers=self.providers,
+        )
+        profile = self._registered_profile()
+        task = engine.submit(self._request(), profile)
+        # Force selection of agent-a specifically via its unique capability.
+        decision = engine.route(task.task_id, profile)
+        self.assertEqual(decision.selected_agent_id, agent_a.agent_id)
+
+        result = engine.execute(task.task_id, working_directory=self._sandbox.name)
+
+        self.assertIs(result.outcome, ExecutionOutcome.COMPLETED)
+        self.assertEqual(len(adapter_a.received_requests), 1)
+        self.assertEqual(len(adapter_b.received_requests), 0)
 
 
 if __name__ == "__main__":

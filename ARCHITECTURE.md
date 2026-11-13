@@ -47,7 +47,7 @@ repository.
 | 9 | Structured logging / audit trail | `audit/logger.py` (logging, done), full audit trail in a later milestone |
 | 10 | Configuration management | `config/settings.py` | **Done** |
 | 11 | Error handling & recovery | `errors.py` | **Done** |
-| 12 | Unit / integration tests | `tests/` | Ongoing; 185/185 passing as of Milestone 4 |
+| 12 | Unit / integration tests | `tests/` | Ongoing; 222/222 passing as of the M4 audit remediation |
 
 Components marked "Done" are real, tested code. Everything else is either a
 genuine interface (7 — Dispatcher, explicitly scoped as an interface) or an
@@ -153,17 +153,25 @@ audit for how each was found.
    never seeded into production code, and `AgentDescriptor.machine` is a
    logical label chosen by whoever calls `register()`, never a verified
    fact about real hardware.
-5. **Claude CLI has no literal "read-only" permission mode.** Verified
-   against real `claude --help` output (Milestone 4): `--permission-mode`
-   accepts `acceptEdits, auto, bypassPermissions, manual, dontAsk, plan`
-   — none named "read-only". `ClaudeCodeAdapter` implements read-only
-   execution as `--tools ""` (every tool disabled) instead, the one
-   option directly and unambiguously documented. This is more
-   restrictive than a hypothetical "read some things, write nothing"
-   mode would be — Planner/Architect/Reviewer roles cannot browse the
-   repository in this milestone, only reason from supplied text. Founder
-   decision needed before loosening this to an allow-list, once this
-   CLI version's exact tool-name list is verified.
+5. **Claude CLI has no literal "read-only" permission mode — narrowed,
+   not resolved, by the M4 audit remediation.** Verified against real
+   `claude --help` output: `--permission-mode` accepts `acceptEdits,
+   auto, bypassPermissions, manual, dontAsk, plan` — none named
+   "read-only". `ClaudeCodeAdapter` implements read-only execution as
+   `--tools ""` (every built-in tool disabled), and the remediation
+   added `--safe-mode`/`--strict-mcp-config`/`--disable-slash-commands`/
+   `--setting-sources user` to also disable plugins, hooks, MCP servers
+   and skills — closing the specific gap an independent audit found
+   (this host's real settings had 15+ enabled plugins that the original
+   `--tools ""`-only policy never accounted for). What remains
+   explicitly unenforced — filesystem isolation, process isolation
+   beyond grouping, and network isolation — is documented, not claimed,
+   in [docs/EXECUTION_CLAUDE_CODE.md](docs/EXECUTION_CLAUDE_CODE.md)'s
+   "Security posture" table. Planner/Architect/Reviewer roles still
+   cannot browse the repository in this milestone, only reason from
+   supplied text. Founder decision still needed before loosening
+   `--tools ""` to an allow-list, once this CLI version's exact
+   tool-name list is verified.
 6. **No DeepSeek Harness CLI is installed anywhere on this host**
    (Milestone 4 addendum compatibility review). Only an HTTP API
    provider plugin inside OpenClaw exists under that name — not a CLI
