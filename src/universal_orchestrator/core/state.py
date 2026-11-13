@@ -31,6 +31,7 @@ from universal_orchestrator.execution.adapter import (
     ExecutionResult,
     VerificationStatus,
 )
+from universal_orchestrator.execution.worktree import WorktreeHandle, WorktreeStatus
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -93,6 +94,24 @@ CREATE TABLE IF NOT EXISTS execution_results (
     error_classification TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_execution_results_task_id ON execution_results(task_id);
+
+-- Milestone 6.1: one worktree per task, enforced by making task_id the
+-- primary key — the same IntegrityError -> DuplicateError translation
+-- pattern already used for tasks/execution_results guarantees "two
+-- executions cannot acquire the same Worktree" at the persistence layer,
+-- not just in application logic.
+CREATE TABLE IF NOT EXISTS worktrees (
+    task_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_worktrees_project_id ON worktrees(project_id);
+CREATE INDEX IF NOT EXISTS idx_worktrees_status ON worktrees(status);
 """
 
 _COLUMNS = (
@@ -268,6 +287,82 @@ class StateManager:
         )
         return [_row_to_execution_result(row) for row in cursor.fetchall()]
 
+    # -- worktrees (Milestone 6.1) ---------------------------------------------
+
+    def save_worktree(self, handle: WorktreeHandle) -> None:
+        """Raises `errors.DuplicateError` on a repeated `task_id` — this
+        is the actual enforcement point for "two executions cannot
+        acquire the same Worktree" (see `execution.worktree_manager`)."""
+        try:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO worktrees (
+                        task_id, project_id, path, branch, base_sha, status,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        handle.task_id,
+                        handle.project_id,
+                        handle.path,
+                        handle.branch,
+                        handle.base_sha,
+                        handle.status.value,
+                        handle.created_at.isoformat(),
+                        handle.updated_at.isoformat(),
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise DuplicateError("Worktree", handle.task_id) from exc
+
+    def update_worktree(self, handle: WorktreeHandle) -> None:
+        with self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE worktrees SET
+                    project_id = ?, path = ?, branch = ?, base_sha = ?,
+                    status = ?, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (
+                    handle.project_id,
+                    handle.path,
+                    handle.branch,
+                    handle.base_sha,
+                    handle.status.value,
+                    handle.updated_at.isoformat(),
+                    handle.task_id,
+                ),
+            )
+        if cursor.rowcount == 0:
+            raise NotFoundError("Worktree", handle.task_id)
+
+    def get_worktree(self, task_id: str) -> WorktreeHandle | None:
+        cursor = self._conn.execute(
+            "SELECT * FROM worktrees WHERE task_id = ?", (task_id,)
+        )
+        row = cursor.fetchone()
+        return _row_to_worktree(row) if row is not None else None
+
+    def list_worktrees(
+        self, *, project_id: str | None = None, status: WorktreeStatus | None = None
+    ) -> list[WorktreeHandle]:
+        query = "SELECT * FROM worktrees"
+        clauses = []
+        params: list[str] = []
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status.value)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at"
+        cursor = self._conn.execute(query, params)
+        return [_row_to_worktree(row) for row in cursor.fetchall()]
+
 
 def _task_to_row(task: Task) -> dict[str, object]:
     return {
@@ -354,4 +449,17 @@ def _row_to_execution_result(row: sqlite3.Row) -> ExecutionResult:
         if row["verification_status"]
         else None,
         error_classification=row["error_classification"],
+    )
+
+
+def _row_to_worktree(row: sqlite3.Row) -> WorktreeHandle:
+    return WorktreeHandle(
+        task_id=row["task_id"],
+        project_id=row["project_id"],
+        path=row["path"],
+        branch=row["branch"],
+        base_sha=row["base_sha"],
+        status=WorktreeStatus(row["status"]),
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
     )
