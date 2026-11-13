@@ -12,10 +12,8 @@ from universal_orchestrator.core.models import (
 
 class ProjectProfileTests(unittest.TestCase):
     def test_gets_generated_id(self):
-        p1 = ProjectProfile(name="psh", repository_path="/home/phongtieu/projects/psh")
-        p2 = ProjectProfile(
-            name="viec-nha-trang", repository_path="/home/phongtieu/viec-nha-trang"
-        )
+        p1 = ProjectProfile(name="demo-a", repository_path="/workspace/demo-a")
+        p2 = ProjectProfile(name="demo-b", repository_path="/workspace/demo-b")
         self.assertTrue(p1.project_id.startswith("proj_"))
         self.assertNotEqual(p1.project_id, p2.project_id)
 

@@ -18,7 +18,8 @@ repository.
 
 ## Hardware roles (verified in Phase 0 discovery)
 
-- **ASUS Ubuntu Server** (`tieu`, `192.168.100.209`) — hosts
+- **ASUS Ubuntu Server** (hostname `tieu`; LAN address recorded in the
+  Founder's private deployment notes, not in this repository) — hosts
   Universal-Orchestrator and runs the orchestration engine. Resource
   constrained: 4 threads, ~7 GB RAM. The Core must not assume more than
   this is available.
