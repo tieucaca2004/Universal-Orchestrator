@@ -158,6 +158,84 @@ class GovernedPipelineTestCase(unittest.TestCase):
         return task.task_id
 
 
+class WorkspaceTransferWiringTests(GovernedPipelineTestCase):
+    """M6 completion, Item 2 — `dispatch()` must actually call
+    `workspace_transfer.copy_in()`/`copy_out()` when one is supplied,
+    in the right order, and dispatch against the *staging* path it
+    returns, not the host Worktree path directly. The transfer
+    mechanism's own real correctness (manifest verification, host-drift
+    refusal, etc.) is proven separately in test_hermes_transfer.py
+    against a real filesystem stand-in; this is purely the wiring."""
+
+    def test_dispatch_uses_the_staging_path_and_calls_copy_in_then_copy_out(self):
+        import unittest.mock as mock
+
+        task_id = self._submit_and_route()
+        handle_path_holder = {}
+        # A real directory stands in for the in-container staging path
+        # here -- the fake Claude executable still needs a real `cwd`
+        # to run in; `HermesWorkspaceTransfer`'s own real correctness
+        # (manifest verification, host-drift refusal, real `docker`
+        # calls) is proven separately in test_hermes_transfer.py. This
+        # test is purely about dispatch()'s own wiring/call order.
+        staging_dir = self.tmp_path / "fake_staging"
+        staging_dir.mkdir()
+
+        transfer = mock.Mock()
+        call_order = []
+
+        def fake_copy_in(host_path):
+            handle_path_holder["host"] = host_path
+            call_order.append("copy_in")
+            return str(staging_dir)
+
+        def fake_copy_out(host_path):
+            call_order.append("copy_out")
+            self.assertEqual(host_path, handle_path_holder["host"])
+
+        transfer.copy_in.side_effect = fake_copy_in
+        transfer.copy_out.side_effect = fake_copy_out
+
+        result = self.pipeline.dispatch(task_id, self.project, workspace_transfer=transfer)
+
+        self.assertEqual(call_order, ["copy_in", "copy_out"])
+        self.assertEqual(result.outcome.value, "completed")
+
+    def test_copy_in_failure_never_dispatches_and_preserves_the_worktree(self):
+        import unittest.mock as mock
+
+        from universal_orchestrator.execution.hermes_transfer import HermesTransferError
+
+        task_id = self._submit_and_route()
+        transfer = mock.Mock()
+        transfer.copy_in.side_effect = HermesTransferError("simulated copy-in failure")
+
+        with self.assertRaises(HermesTransferError):
+            self.pipeline.dispatch(task_id, self.project, workspace_transfer=transfer)
+
+        transfer.copy_out.assert_not_called()
+        self.assertEqual(self.worktrees.get(task_id).status, WorktreeStatus.NEEDS_REVIEW)
+        # The real Agent call never happened.
+        self.assertEqual(self.engine.manager.get_execution_results(task_id), [])
+
+    def test_copy_out_failure_surfaces_rather_than_being_hidden(self):
+        import unittest.mock as mock
+
+        from universal_orchestrator.execution.hermes_transfer import HermesTransferError
+
+        task_id = self._submit_and_route()
+        transfer = mock.Mock()
+        transfer.copy_in.return_value = "/fake/staging/path"
+        transfer.copy_out.side_effect = HermesTransferError("simulated copy-out failure")
+
+        with self.assertRaises(HermesTransferError):
+            self.pipeline.dispatch(task_id, self.project, workspace_transfer=transfer)
+
+        self.assertEqual(self.worktrees.get(task_id).status, WorktreeStatus.NEEDS_REVIEW)
+        # The real Agent call *did* happen -- only the copy-out failed.
+        self.assertEqual(len(self.engine.manager.get_execution_results(task_id)), 1)
+
+
 class HappyPathTests(GovernedPipelineTestCase):
     def test_full_pipeline_submit_to_integrated(self):
         task_id = self._submit_and_route()

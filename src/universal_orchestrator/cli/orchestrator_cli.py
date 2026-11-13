@@ -63,6 +63,7 @@ from universal_orchestrator.execution.approval_manager import ApprovalGate
 from universal_orchestrator.execution.claude_code import ClaudeCodeAdapter
 from universal_orchestrator.execution.conflict_manager import ConflictManager
 from universal_orchestrator.execution.hermes import HermesAdapter
+from universal_orchestrator.execution.hermes_transfer import HermesWorkspaceTransfer
 from universal_orchestrator.execution.quality_manager import QualityGate
 from universal_orchestrator.execution.registry import AdapterRegistry
 from universal_orchestrator.execution.worktree_manager import WorktreeManager
@@ -149,6 +150,16 @@ def cmd_submit(args: argparse.Namespace) -> int:
         if args.permission_mode == "worktree_write":
             policy = ExecutionPolicy(permission_mode=PermissionMode.WORKTREE_WRITE)
 
+        # Hermes runs in a container with no bind mount for a project
+        # workspace (docs/EXECUTION_HERMES.md) — the host Worktree path
+        # means nothing inside it. The transfer makes the Worktree
+        # reachable via controlled copy-in/copy-out instead of ever
+        # reconfiguring the live container. Claude (and any adapter
+        # that runs natively on this host) needs no transfer at all.
+        workspace_transfer = None
+        if args.adapter == "hermes":
+            workspace_transfer = HermesWorkspaceTransfer(container=args.adapter_target or "hermes")
+
         print(f"TASK_ID={task.task_id}")
         print(
             f"Dispatching real {args.adapter} Agent (agent_id={agent_id}, "
@@ -156,7 +167,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         )
         result = pipeline.dispatch(
             task.task_id, project, input_context=args.input_context,
-            timeout_seconds=args.timeout, policy=policy,
+            timeout_seconds=args.timeout, policy=policy, workspace_transfer=workspace_transfer,
         )
         print(f"EXECUTION_OUTCOME={result.outcome.value}")
         print(f"EXECUTION_ID={result.execution_id}")

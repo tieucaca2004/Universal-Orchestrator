@@ -42,6 +42,7 @@ from universal_orchestrator.execution.adapter import ExecutionPolicy, ExecutionR
 from universal_orchestrator.execution.approval import IntegrationProposal
 from universal_orchestrator.execution.approval_manager import ApprovalGate
 from universal_orchestrator.execution.conflict_manager import ConflictManager
+from universal_orchestrator.execution.hermes_transfer import HermesWorkspaceTransfer
 from universal_orchestrator.execution.quality import QualityReport, QualityVerdict
 from universal_orchestrator.execution.quality_manager import QualityGate
 from universal_orchestrator.execution.worktree import WorktreeStatus
@@ -83,6 +84,7 @@ class GovernedPipeline:
         input_context: str = "",
         timeout_seconds: float = 60.0,
         policy: ExecutionPolicy | None = None,
+        workspace_transfer: HermesWorkspaceTransfer | None = None,
     ) -> ExecutionResult:
         """Steps 1-4 of the Founder-specified sequence only: acquire a
         dedicated Worktree, dispatch the real Agent into it, and commit
@@ -107,10 +109,28 @@ class GovernedPipeline:
         self.worktrees.transition(task_id, WorktreeStatus.EXECUTING)
         self.engine.manager.start(task_id)
 
+        # Hermes runs in a container with no bind mount for a project
+        # workspace — the host Worktree path means nothing inside it.
+        # When a transfer is supplied (M6 completion, Item 2), copy the
+        # Worktree into a disposable in-container staging path and
+        # dispatch there instead; the host Worktree stays authoritative
+        # throughout (see execution.hermes_transfer's own module
+        # docstring for the full guarantee). Claude and any adapter
+        # that runs natively on this host need no transfer at all.
+        working_directory = handle.path
+        if workspace_transfer is not None:
+            try:
+                working_directory = workspace_transfer.copy_in(handle.path)
+            except Exception:
+                # Never proceed to execution against an unverified
+                # copy-in — the host Worktree is untouched either way.
+                self.worktrees.transition(task_id, WorktreeStatus.NEEDS_REVIEW)
+                raise
+
         try:
             result = self.engine.execute(
                 task_id,
-                working_directory=handle.path,
+                working_directory=working_directory,
                 input_context=input_context,
                 timeout_seconds=timeout_seconds,
                 policy=policy,
@@ -119,8 +139,26 @@ class GovernedPipeline:
             # Dispatch itself failed (adapter unavailable, stale routing
             # decision, ...) — never silently discard the Worktree; a
             # human must look at it before it is reused or released.
+            # Still attempt copy-out below is skipped here deliberately:
+            # if the Agent never ran, there is nothing new to recover
+            # from the staging path, and the staging directory itself
+            # is left in place (never cleaned up outside a verified
+            # copy_out) for inspection.
             self.worktrees.transition(task_id, WorktreeStatus.NEEDS_REVIEW)
             raise
+
+        if workspace_transfer is not None:
+            try:
+                # Always attempt copy-out, success or failure of the
+                # Agent call itself — even a failed run may have left
+                # partial, inspectable work in the staging directory.
+                workspace_transfer.copy_out(handle.path)
+            except Exception:
+                # Staging preserved by copy_out() itself on any failure
+                # path (see execution.hermes_transfer) — never claim
+                # this risk is solved; surface it instead of hiding it.
+                self.worktrees.transition(task_id, WorktreeStatus.NEEDS_REVIEW)
+                raise
 
         # Adapters (Claude CLI, Hermes) know nothing about Git — they
         # only write files. Capturing whatever the Agent produced into
@@ -212,6 +250,7 @@ class GovernedPipeline:
         input_context: str = "",
         timeout_seconds: float = 60.0,
         policy: ExecutionPolicy | None = None,
+        workspace_transfer: HermesWorkspaceTransfer | None = None,
         criteria_evidence: dict[str, bool] | None = None,
     ) -> IntegrationProposal | None:
         """Convenience wrapper over `dispatch()` + `evaluate_and_propose()`
@@ -224,7 +263,8 @@ class GovernedPipeline:
         collected strictly after execution, never before. Kept for
         backward compatibility; contains no logic of its own."""
         self.dispatch(
-            task_id, project, input_context=input_context, timeout_seconds=timeout_seconds, policy=policy
+            task_id, project, input_context=input_context, timeout_seconds=timeout_seconds,
+            policy=policy, workspace_transfer=workspace_transfer,
         )
         return self.evaluate_and_propose(task_id, project, criteria_evidence=criteria_evidence)
 
