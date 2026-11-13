@@ -1,0 +1,19 @@
+[project]
+name = "universal-orchestrator"
+version = "0.1.0"
+description = "Independent central orchestration Core coordinating projects, agents, providers and execution environments."
+readme = "README.md"
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# This host has no pip and no ensurepip (stripped-down Python 3.14 build;
+# see README "Running tests"), so tests use the standard-library unittest
+# runner rather than pytest. Revisit if python3-pip/python3-venv are ever
+# installed system-wide (requires Founder approval — see ARCHITECTURE.md
+# approval boundaries).

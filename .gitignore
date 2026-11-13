@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+var/
+*.sqlite3
+*.db
+.env
+.env.*
+
+# Local Claude Code harness state, not part of the project.
+.claude/
