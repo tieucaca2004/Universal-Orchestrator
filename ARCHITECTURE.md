@@ -42,12 +42,12 @@ repository.
 | 5 | Task Lifecycle + persistent state | `core/models.py`, `core/lifecycle.py`, `core/state.py` (SQLite) | **Done** — see [docs/TASK_LIFECYCLE.md](docs/TASK_LIFECYCLE.md) |
 | 6 | Task Planner interface | `planning/planner.py` | **Done** (interface) |
 | 7 | Dispatcher interface | `planning/dispatcher.py` | **Done** (interface) |
-| 8 | Execution Adapter interface + Claude Code Adapter | `execution/adapter.py`, `execution/claude_code.py` | **Done** — see [docs/EXECUTION_CLAUDE_CODE.md](docs/EXECUTION_CLAUDE_CODE.md). Dispatcher itself remains unimplemented; a future DeepSeek adapter is not implemented (none installed to verify against). |
-| 8a | Adapter Registry (multi-engine selection) | `execution/registry.py` | **Done** — see [docs/EXECUTION_CLAUDE_CODE.md](docs/EXECUTION_CLAUDE_CODE.md) "Multi-engine architecture" |
+| 8 | Execution Adapter interface + Claude Code Adapter + Hermes Adapter | `execution/adapter.py`, `execution/claude_code.py`, `execution/hermes.py` | **Done** — see [docs/EXECUTION_CLAUDE_CODE.md](docs/EXECUTION_CLAUDE_CODE.md) and [docs/EXECUTION_HERMES.md](docs/EXECUTION_HERMES.md). Dispatcher itself remains unimplemented; a future DeepSeek adapter is not implemented (none installed to verify against — see docs/EXECUTION_CLAUDE_CODE.md "DeepSeek compatibility review"). |
+| 8a | Adapter Registry (multi-engine selection) | `execution/registry.py` | **Done**, now proven with two real adapters — see [docs/EXECUTION_HERMES.md](docs/EXECUTION_HERMES.md) "Multi-runtime architecture" and `tests/test_multi_runtime.py` |
 | 9 | Structured logging / audit trail | `audit/logger.py` (logging, done), full audit trail in a later milestone |
 | 10 | Configuration management | `config/settings.py` | **Done** |
 | 11 | Error handling & recovery | `errors.py` | **Done** |
-| 12 | Unit / integration tests | `tests/` | Ongoing; 222/222 passing as of the M4 audit remediation |
+| 12 | Unit / integration tests | `tests/` | Ongoing; 257/257 passing as of Milestone 5 |
 
 Components marked "Done" are real, tested code. Everything else is either a
 genuine interface (7 — Dispatcher, explicitly scoped as an interface) or an
@@ -95,7 +95,7 @@ sequence must not change without Founder approval.
 2. **M2 — Task Analyzer, Task Manager, State Manager.** **Done.**
 3. **M3 — Project Registry, Agent Registry, Provider Registry, Agent Router.** **Done.**
 4. **M4 — Claude CLI Adapter and non-interactive execution verification.** **Done.**
-5. **M5 — Hermes Adapter and execution verification.**
+5. **M5 — Hermes Adapter and execution verification.** **Done.**
 6. **M6 — Git Worktree, Conflict Manager, Approval Gate and Quality Gate.**
 7. **M7 — Worker Protocol and RTX 3070 integration.**
 8. **M8 — End-to-end testing, backup, recovery and final acceptance.**
@@ -178,3 +178,18 @@ audit for how each was found.
    harness. DeepSeek compatibility with `ExecutionAdapter` therefore
    remains unverified, and no DeepSeek adapter is implemented. See
    [docs/EXECUTION_CLAUDE_CODE.md](docs/EXECUTION_CLAUDE_CODE.md).
+7. **Hermes's zero-tool enforcement relies on an unrecognized-toolset
+   name, not an officially documented flag value** (Milestone 5).
+   Verified by tracing Hermes's own source and by two real executions
+   (`cli.py --list_tools` and, separately, a real `hermes chat` call)
+   that an unrecognized `-t/--toolsets` value yields zero enabled
+   tools — but this is observed behavior of the current version
+   (v0.21.0), not a contract Hermes documents or promises to keep. See
+   [docs/EXECUTION_HERMES.md](docs/EXECUTION_HERMES.md) "The zero-tool
+   mechanism" and "Known limitations". Also note: killing the local
+   `docker exec` client does not stop the in-container process by
+   itself — verified empirically — so `HermesAdapter`'s timeout path
+   does additional, targeted in-container PID termination that
+   `ClaudeCodeAdapter` never needed. Founder awareness requested before
+   this mechanism is relied on for anything beyond the scratch-sandbox
+   execution this milestone verified.

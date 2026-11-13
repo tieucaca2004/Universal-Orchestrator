@@ -1,9 +1,13 @@
 """Execution Adapter interface.
 
-Every concrete integration (Claude Code CLI, a future DeepSeek Harness
-CLI, Hermes, ...) implements this contract. `ClaudeCodeAdapter`
-(`execution/claude_code.py`) is the first concrete implementation,
-landing in Milestone 4.
+Every concrete integration (Claude Code CLI, Hermes, a future DeepSeek
+Harness CLI, ...) implements this contract. `ClaudeCodeAdapter`
+(`execution/claude_code.py`, Milestone 4) and `HermesAdapter`
+(`execution/hermes.py`, Milestone 5) are the two concrete
+implementations so far — neither this file nor `core/engine.py`,
+`routing/router.py`, or `registry/providers.py` contains any
+runtime-specific code; both adapters are selected purely by
+`provider_id` through `execution/registry.py`'s `AdapterRegistry`.
 
 Interface change from Milestone 1, justified (grep confirmed zero
 callers of either symbol anywhere in this repository before this
