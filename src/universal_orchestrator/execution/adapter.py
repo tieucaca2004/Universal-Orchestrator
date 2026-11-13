@@ -60,11 +60,21 @@ class ExecutionOutcome(enum.Enum):
 
 
 class PermissionMode(enum.Enum):
-    """`READ_ONLY` is the only mode Milestone 4 implements — see
+    """`READ_ONLY` was the only mode Milestone 4 implemented — see
     execution/claude_code.py and docs/EXECUTION_CLAUDE_CODE.md for what
-    "read-only" is verified to actually mean for this adapter."""
+    "read-only" is verified to actually mean for this adapter.
+
+    `WORKTREE_WRITE` (M6 completion) enables the Agent's own file
+    tools (Read/Write/Edit/Bash) *and* wraps the real subprocess in a
+    real OS-level sandbox (`bwrap`/user namespaces) that makes every
+    path except the task's own Worktree read-only to the Agent —
+    enforced by the kernel, not by `working_directory`/`cwd` alone.
+    An adapter that cannot provide real containment for this mode must
+    fail closed rather than silently running with write tools enabled
+    and no sandbox — see `execution.claude_code`'s own check."""
 
     READ_ONLY = "read_only"
+    WORKTREE_WRITE = "worktree_write"
 
 
 @dataclass(slots=True)

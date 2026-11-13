@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from universal_orchestrator.core.engine import OrchestrationEngine
 from universal_orchestrator.core.models import ProjectProfile, TaskError
 from universal_orchestrator.errors import OrchestratorError
-from universal_orchestrator.execution.adapter import ExecutionResult
+from universal_orchestrator.execution.adapter import ExecutionPolicy, ExecutionResult
 from universal_orchestrator.execution.approval import IntegrationProposal
 from universal_orchestrator.execution.approval_manager import ApprovalGate
 from universal_orchestrator.execution.conflict_manager import ConflictManager
@@ -82,6 +82,7 @@ class GovernedPipeline:
         *,
         input_context: str = "",
         timeout_seconds: float = 60.0,
+        policy: ExecutionPolicy | None = None,
     ) -> ExecutionResult:
         """Steps 1-4 of the Founder-specified sequence only: acquire a
         dedicated Worktree, dispatch the real Agent into it, and commit
@@ -89,6 +90,14 @@ class GovernedPipeline:
         already persisted by `engine.execute()`) so the caller —
         Founder, a Reviewer-role agent, or an automated check — can
         inspect the *actual* output before deciding on evidence.
+
+        `policy` is passed straight through to `engine.execute()` —
+        this is the hook that lets a caller request
+        `PermissionMode.WORKTREE_WRITE` (M6 completion) instead of the
+        default read-only policy, for an adapter that supports it and
+        can provide real containment. This method never changes what
+        the policy means or weakens it; it only forwards the caller's
+        explicit choice.
 
         Evidence is never collected here and never before this method
         returns — that was M6 remediation's Item 1 finding: evidence
@@ -104,6 +113,7 @@ class GovernedPipeline:
                 working_directory=handle.path,
                 input_context=input_context,
                 timeout_seconds=timeout_seconds,
+                policy=policy,
             )
         except Exception:
             # Dispatch itself failed (adapter unavailable, stale routing
@@ -201,6 +211,7 @@ class GovernedPipeline:
         *,
         input_context: str = "",
         timeout_seconds: float = 60.0,
+        policy: ExecutionPolicy | None = None,
         criteria_evidence: dict[str, bool] | None = None,
     ) -> IntegrationProposal | None:
         """Convenience wrapper over `dispatch()` + `evaluate_and_propose()`
@@ -212,7 +223,9 @@ class GovernedPipeline:
         `evaluate_and_propose()` separately for that, so evidence is
         collected strictly after execution, never before. Kept for
         backward compatibility; contains no logic of its own."""
-        self.dispatch(task_id, project, input_context=input_context, timeout_seconds=timeout_seconds)
+        self.dispatch(
+            task_id, project, input_context=input_context, timeout_seconds=timeout_seconds, policy=policy
+        )
         return self.evaluate_and_propose(task_id, project, criteria_evidence=criteria_evidence)
 
     def integrate_after_approval(

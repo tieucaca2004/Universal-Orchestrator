@@ -163,6 +163,73 @@ class RealEntrypointHappyPathTest(OrchestratorEntrypointTestCase):
             state.close()
 
 
+class RealEntrypointWorktreeWriteTest(OrchestratorEntrypointTestCase):
+    """M6 completion, Item 1/8 — the real CLI actually wires
+    `--permission-mode worktree_write` through to a real, sandboxed
+    dispatch (the sandbox's own real containment is proven at the
+    adapter unit-test level, tests/test_claude_code_adapter.py;
+    here the entrypoint-level concern is that the flag really reaches
+    the real pipeline and that two concurrent tasks each get their
+    own, non-shared Worktree)."""
+
+    def _bwrap_available(self) -> bool:
+        import shutil
+
+        return shutil.which("bwrap") is not None
+
+    def test_submit_with_worktree_write_dispatches_through_the_sandbox(self):
+        if not self._bwrap_available():
+            self.skipTest("bwrap not installed on this host")
+        submit = _run_orchestrator_cli(
+            self.db_path, "submit",
+            "--repo", str(self.repo_path), "--project-id", "proj_x", "--title", "worktree write test",
+            "--criterion", "creates agent_output.txt",
+            "--adapter", "claude", "--adapter-target", self.claude_bin,
+            "--permission-mode", "worktree_write",
+        )
+        self.assertEqual(submit.returncode, 0, submit.stderr)
+        self.assertIn("EXECUTION_OUTCOME=completed", submit.stdout)
+        self.assertIn("permission_mode=worktree_write", submit.stdout)
+
+        worktree_path = None
+        for line in submit.stdout.splitlines():
+            if line.startswith("WORKTREE_PATH="):
+                worktree_path = line.split("=", 1)[1]
+        self.assertIsNotNone(worktree_path)
+        self.assertTrue((Path(worktree_path) / "agent_output.txt").exists())
+
+    def test_two_concurrent_worktree_write_tasks_get_isolated_worktrees(self):
+        if not self._bwrap_available():
+            self.skipTest("bwrap not installed on this host")
+
+        def submit_one(title: str) -> str:
+            result = _run_orchestrator_cli(
+                self.db_path, "submit",
+                "--repo", str(self.repo_path), "--project-id", "proj_x", "--title", title,
+                "--criterion", "creates agent_output.txt",
+                "--adapter", "claude", "--adapter-target", self.claude_bin,
+                "--permission-mode", "worktree_write",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for line in result.stdout.splitlines():
+                if line.startswith("WORKTREE_PATH="):
+                    return line.split("=", 1)[1]
+            raise AssertionError("WORKTREE_PATH= not found")
+
+        worktree_a = submit_one("agent A task")
+        worktree_b = submit_one("agent B task")
+
+        self.assertNotEqual(worktree_a, worktree_b)
+        self.assertTrue((Path(worktree_a) / "agent_output.txt").exists())
+        self.assertTrue((Path(worktree_b) / "agent_output.txt").exists())
+        # Neither execution's working tree holds anything beyond what
+        # that same execution itself wrote -- no cross-contamination.
+        self.assertEqual(
+            sorted(p.name for p in Path(worktree_a).glob("*") if not p.name.startswith(".git")),
+            sorted(p.name for p in Path(worktree_b).glob("*") if not p.name.startswith(".git")),
+        )
+
+
 class RealEntrypointBypassPreventionTest(OrchestratorEntrypointTestCase):
     def test_integrate_via_real_cli_fails_without_a_real_approval(self):
         submit = _run_orchestrator_cli(

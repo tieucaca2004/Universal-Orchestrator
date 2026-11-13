@@ -58,6 +58,7 @@ from universal_orchestrator.core.models import (
     TaskRequest,
 )
 from universal_orchestrator.core.state import StateManager
+from universal_orchestrator.execution.adapter import ExecutionPolicy, PermissionMode
 from universal_orchestrator.execution.approval_manager import ApprovalGate
 from universal_orchestrator.execution.claude_code import ClaudeCodeAdapter
 from universal_orchestrator.execution.conflict_manager import ConflictManager
@@ -144,10 +145,18 @@ def cmd_submit(args: argparse.Namespace) -> int:
         task_obj.payload["required_role"] = "coder"
         engine.route(task.task_id, project)
 
+        policy = None
+        if args.permission_mode == "worktree_write":
+            policy = ExecutionPolicy(permission_mode=PermissionMode.WORKTREE_WRITE)
+
         print(f"TASK_ID={task.task_id}")
-        print(f"Dispatching real {args.adapter} Agent (agent_id={agent_id}) ...")
+        print(
+            f"Dispatching real {args.adapter} Agent (agent_id={agent_id}, "
+            f"permission_mode={args.permission_mode}) ..."
+        )
         result = pipeline.dispatch(
-            task.task_id, project, input_context=args.input_context, timeout_seconds=args.timeout
+            task.task_id, project, input_context=args.input_context,
+            timeout_seconds=args.timeout, policy=policy,
         )
         print(f"EXECUTION_OUTCOME={result.outcome.value}")
         print(f"EXECUTION_ID={result.execution_id}")
@@ -280,6 +289,11 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--adapter", choices=["claude", "hermes"], default="claude")
     submit.add_argument("--adapter-target", default="")
     submit.add_argument("--timeout", type=float, default=60.0)
+    submit.add_argument(
+        "--permission-mode", choices=["read_only", "worktree_write"], default="read_only",
+        help="'worktree_write' grants the Agent its own coding tools, sandboxed to this task's "
+             "Worktree only (requires 'bwrap' on PATH; fails closed if unavailable).",
+    )
     submit.set_defaults(func=cmd_submit)
 
     extract = sub.add_parser("extract-claude-files", help="Write the Agent's real reply text into real files.")

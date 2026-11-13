@@ -23,9 +23,37 @@ OAuth-authenticated host — a real, verified incompatibility, not an
 assumption. `--dangerously-skip-permissions` and
 `--allow-dangerously-skip-permissions` are never used.
 
-None of this is filesystem, process, or network sandboxing — it is CLI
-configuration only, verified against this one CLI version's documented
-flags. See "Known limitations" in the docs for exactly what is and is
+None of the above is filesystem, process, or network sandboxing for
+`PermissionMode.READ_ONLY` (the only mode that existed through
+Milestone 5) — it is CLI configuration only, verified against this one
+CLI version's documented flags.
+
+`PermissionMode.WORKTREE_WRITE` (M6 completion) is a second, separate,
+opt-in mode with a materially different, honestly-documented posture:
+`--tools "Read,Write,Edit,Bash"` replaces `--tools ""`, and
+`--permission-mode bypassPermissions` replaces the absence of that flag
+— both `acceptEdits` (tried first) and the complete absence of a
+permission-mode flag were empirically found, via real calls this
+session, to still deny some real Bash tool calls with no TTY to
+confirm against; `bypassPermissions` is what reliably removed that.
+This **does** remove the CLI's own interactive tool-confirmation layer
+for this mode — stated plainly, not hidden. The actual safety boundary
+for `WORKTREE_WRITE` is therefore (1) the four-tool allow-list itself
+— nothing beyond Read/Write/Edit/Bash exists, and every other
+isolation flag above remains active — and (2) real, kernel-enforced
+filesystem containment (`bwrap`/Linux user namespaces, see
+`_build_sandboxed_command`): every path is read-only to the process
+except the task's own Worktree (plus two small, non-project,
+non-secret scratch directories Claude's own Bash tool needs to
+initialize at all — never `~/.claude/settings.json`, which stays
+read-only). This was verified empirically this session, outside any
+test harness, with a real absolute-path write attempt outside the
+Worktree failing with a real "Read-only file system" OS error. If
+`bwrap` is not on PATH, this adapter fails closed
+(`sandbox_unavailable`) rather than ever running with write tools
+enabled and no real containment.
+
+See "Known limitations" in the docs for exactly what is and is
 not covered.
 """
 
@@ -88,6 +116,56 @@ _ISOLATION_FLAGS = (
 _ENV_ALLOWLIST = ("HOME", "PATH", "LANG", "LC_ALL", "TERM", "TMPDIR")
 
 _AUTH_CHECK_TIMEOUT_SECONDS = 15
+
+# M6 completion — WORKTREE_WRITE mode. These are the only built-in
+# tools enabled when write access is granted: file read/create/edit
+# and a shell for running the task's own test commands. Real
+# containment (below) is what makes enabling Bash here safe — not the
+# tool list by itself.
+_WORKTREE_WRITE_TOOLS = "Read,Write,Edit,Bash"
+
+_SANDBOX_BIN = "bwrap"
+
+# Claude Code's own Bash tool needs a small amount of scratch space
+# outside the Worktree to function at all (its own session/environment
+# bookkeeping) — discovered empirically this session: without these,
+# every Bash tool call fails to even start, with a real "Read-only
+# file system" error from Claude's own tooling, not from this
+# adapter's prompt. Neither path contains project data or secrets;
+# `~/.claude/settings.json` (the credential file) is deliberately
+# *not* included here and stays read-only, same as every other path
+# outside the Worktree.
+_CLAUDE_SESSION_ENV_DIR = str(Path.home() / ".claude" / "session-env")
+_CLAUDE_TMP_SCRATCH_DIR = f"/tmp/claude-{os.getuid()}"
+
+
+def _build_sandboxed_command(inner_command: list[str], worktree_path: str) -> list[str]:
+    """Wraps `inner_command` so that, enforced by the kernel (Linux user
+    namespaces via `bwrap`), every path on the filesystem is read-only
+    to the sandboxed process *except* `worktree_path` and Claude's own
+    non-project scratch directories (see above) — those are the only
+    writable bind mounts. `--unshare-pid` additionally hides the
+    host's other processes from the sandboxed one. Empirically verified
+    this session, outside any test harness, that an absolute-path
+    write attempt to a path other than these bound paths fails with a
+    real "Read-only file system" OS error — not a convention, not
+    something `cwd=` alone would have provided."""
+    os.makedirs(_CLAUDE_SESSION_ENV_DIR, exist_ok=True)
+    os.makedirs(_CLAUDE_TMP_SCRATCH_DIR, exist_ok=True)
+    return [
+        _SANDBOX_BIN,
+        "--ro-bind", "/", "/",
+        "--dev", "/dev",
+        "--proc", "/proc",
+        "--bind", worktree_path, worktree_path,
+        "--bind", _CLAUDE_SESSION_ENV_DIR, _CLAUDE_SESSION_ENV_DIR,
+        "--bind", _CLAUDE_TMP_SCRATCH_DIR, _CLAUDE_TMP_SCRATCH_DIR,
+        "--unshare-pid",
+        "--die-with-parent",
+        "--chdir", worktree_path,
+        "--",
+        *inner_command,
+    ]
 _HELP_CHECK_TIMEOUT_SECONDS = 10
 _VERSION_CHECK_TIMEOUT_SECONDS = 10
 _PROCESS_GROUP_GRACE_SECONDS = 3
@@ -252,7 +330,10 @@ class ClaudeCodeAdapter(ExecutionAdapter):
             # "Known limitations" for what that does and doesn't cover.
             return self._completed[request.execution_id]
 
-        if request.policy.permission_mode is not PermissionMode.READ_ONLY:
+        if request.policy.permission_mode not in (
+            PermissionMode.READ_ONLY,
+            PermissionMode.WORKTREE_WRITE,
+        ):
             return self._cache_and_return(
                 ExecutionResult(
                     execution_id=request.execution_id,
@@ -263,6 +344,24 @@ class ClaudeCodeAdapter(ExecutionAdapter):
                         f"permission mode '{request.policy.permission_mode}' is not "
                         "implemented by this adapter; failing closed rather than "
                         "running with an unverified policy"
+                    ),
+                )
+            )
+
+        use_worktree_write = request.policy.permission_mode is PermissionMode.WORKTREE_WRITE
+        if use_worktree_write and shutil.which(_SANDBOX_BIN) is None:
+            # Never silently fall back to running with write tools
+            # enabled and no containment — fail closed instead.
+            return self._cache_and_return(
+                ExecutionResult(
+                    execution_id=request.execution_id,
+                    task_id=request.task_id,
+                    outcome=ExecutionOutcome.ERROR,
+                    error_classification="sandbox_unavailable",
+                    stderr=(
+                        f"WORKTREE_WRITE requires '{_SANDBOX_BIN}' for real filesystem "
+                        "containment; it is not available on PATH, so this adapter "
+                        "refuses to grant write tools without a sandbox"
                     ),
                 )
             )
@@ -310,8 +409,31 @@ class ClaudeCodeAdapter(ExecutionAdapter):
             "--no-session-persistence",
             *_ISOLATION_FLAGS,
             "--tools",
-            "",
+            _WORKTREE_WRITE_TOOLS if use_worktree_write else "",
         ]
+        if use_worktree_write:
+            # Without an explicit permission-mode, the CLI's own
+            # non-interactive `-p` mode denies every Write/Edit/Bash
+            # tool call outright (there is no TTY to confirm against) —
+            # verified empirically this session via a real call's
+            # `permission_denials` field. `acceptEdits` was tried first
+            # and auto-approved Write/Edit reliably, but still denied
+            # some real Bash calls mid-session (also verified
+            # empirically, via a real multi-step task) — `bypassPermissions`
+            # is what reliably removes interactive confirmation for
+            # every tool call in testing. This is a real, honest
+            # trade-off, not hidden: it is **not** a substitute for the
+            # real safety boundary here, which is (1) the `--tools`
+            # allow-list above — only Read/Write/Edit/Bash exist at
+            # all, nothing else, no MCP/plugins/computer-use/web —
+            # together with the unchanged `_ISOLATION_FLAGS`
+            # (--safe-mode etc.), and (2) the kernel-enforced sandbox
+            # below, which is what actually bounds what those four
+            # tools can do to the filesystem regardless of what the
+            # CLI's own permission layer would have decided.
+            command = [*command, "--permission-mode", "bypassPermissions"]
+            # Real, kernel-enforced containment — not `cwd=` alone.
+            command = _build_sandboxed_command(command, request.working_directory)
 
         started_at = datetime.now(timezone.utc)
         start_perf = time.monotonic()

@@ -584,5 +584,139 @@ class VerificationStatusPopulationTests(AdapterTestCase):
         self.assertEqual(result.error_classification, "adapter_unauthenticated")
 
 
+class WorktreeWriteModeTests(AdapterTestCase):
+    """M6 completion — WORKTREE_WRITE. `bwrap`-dependent tests are
+    skipped (not faked) when the real sandbox binary isn't on this
+    host's PATH — real kernel-level containment cannot be honestly
+    proven any other way, and this adapter refuses to pretend
+    otherwise (see the fail-closed test below, which needs no sandbox
+    at all)."""
+
+    def _bwrap_available(self) -> bool:
+        import shutil
+
+        return shutil.which("bwrap") is not None
+
+    def test_worktree_write_mode_passes_the_expanded_tools_list(self):
+        if not self._bwrap_available():
+            self.skipTest("bwrap not installed on this host")
+        adapter = self._fake_adapter()
+        request = self._request(
+            "hello", policy=ExecutionPolicy(permission_mode=PermissionMode.WORKTREE_WRITE)
+        )
+        result = adapter.execute(request)
+        argv = json.loads(result.stderr.splitlines()[0])
+
+        self.assertIn("--tools", argv)
+        self.assertEqual(argv[argv.index("--tools") + 1], "Read,Write,Edit,Bash")
+
+    def test_worktree_write_mode_really_contains_writes_to_the_worktree_only(self):
+        """Not a convention check — a real write attempt outside the
+        Worktree, from inside the real sandbox, must really fail at
+        the OS level."""
+        if not self._bwrap_available():
+            self.skipTest("bwrap not installed on this host")
+
+        outside_dir = self.tmp_path / "outside"
+        outside_dir.mkdir()
+        outside_marker = outside_dir / "should_never_be_written.txt"
+
+        source = textwrap.dedent(
+            f"""\
+            #!/usr/bin/env python3
+            import json, sys
+            args = sys.argv[1:]
+            if args == ["--version"]:
+                print("9.9.9 (Fake Claude)"); sys.exit(0)
+            if args == ["--help"]:
+                print(
+                    "-p, --print\\n--output-format\\n--tools\\n--no-session-persistence\\n"
+                    "--safe-mode\\n--strict-mcp-config\\n--disable-slash-commands\\n--setting-sources\\n"
+                )
+                sys.exit(0)
+            if len(args) >= 2 and args[0:2] == ["auth", "status"]:
+                print(json.dumps({{"loggedIn": True}})); sys.exit(0)
+            with open("inside_worktree.txt", "w") as f:
+                f.write("written inside the worktree\\n")
+            outside_blocked = False
+            try:
+                with open({str(outside_marker)!r}, "w") as f:
+                    f.write("should never succeed\\n")
+            except OSError:
+                outside_blocked = True
+            print(json.dumps({{"is_error": False, "result": "done", "outside_blocked": outside_blocked}}))
+            sys.exit(0)
+            """
+        )
+        adapter = self._fake_adapter(source)
+        request = self._request(
+            "hello", policy=ExecutionPolicy(permission_mode=PermissionMode.WORKTREE_WRITE)
+        )
+
+        result = adapter.execute(request)
+
+        self.assertIs(result.outcome, ExecutionOutcome.COMPLETED)
+        self.assertTrue((self.sandbox / "inside_worktree.txt").exists())
+        self.assertTrue(result.structured_output["outside_blocked"])
+        self.assertFalse(outside_marker.exists())
+
+    def test_worktree_write_mode_fails_closed_when_sandbox_binary_is_missing(self):
+        import universal_orchestrator.execution.claude_code as claude_code_module
+
+        original = claude_code_module._SANDBOX_BIN
+        claude_code_module._SANDBOX_BIN = "bwrap-does-not-exist-on-this-host-xyz"
+        try:
+            adapter = self._fake_adapter()
+            request = self._request(
+                "hello", policy=ExecutionPolicy(permission_mode=PermissionMode.WORKTREE_WRITE)
+            )
+            result = adapter.execute(request)
+        finally:
+            claude_code_module._SANDBOX_BIN = original
+
+        self.assertIs(result.outcome, ExecutionOutcome.ERROR)
+        self.assertEqual(result.error_classification, "sandbox_unavailable")
+        # Never ran the inner command at all -- no side effect exists.
+        self.assertFalse((self.sandbox / "inside_worktree.txt").exists())
+
+    def test_worktree_write_mode_wraps_with_bwrap_and_bypass_permissions_and_scratch_binds(self):
+        if not self._bwrap_available():
+            self.skipTest("bwrap not installed on this host")
+        import unittest.mock as mock
+
+        import universal_orchestrator.execution.claude_code as claude_code_module
+
+        adapter = self._fake_adapter()
+        request = self._request(
+            "hello", policy=ExecutionPolicy(permission_mode=PermissionMode.WORKTREE_WRITE)
+        )
+        captured = {}
+        real_popen = subprocess.Popen
+
+        def spy_popen(command, **kwargs):
+            captured["command"] = command
+            return real_popen(command, **kwargs)
+
+        with mock.patch.object(subprocess, "Popen", side_effect=spy_popen):
+            adapter.execute(request)
+
+        command = captured["command"]
+        self.assertEqual(command[0], "bwrap")
+        self.assertIn("--permission-mode", command)
+        self.assertEqual(command[command.index("--permission-mode") + 1], "bypassPermissions")
+        self.assertIn(claude_code_module._CLAUDE_SESSION_ENV_DIR, command)
+        self.assertIn(claude_code_module._CLAUDE_TMP_SCRATCH_DIR, command)
+        # The Worktree itself is bound read-write, named explicitly.
+        self.assertIn(str(self.sandbox), command)
+
+    def test_read_only_mode_is_completely_unaffected_by_worktree_write_existing(self):
+        adapter = self._fake_adapter()
+        result = adapter.execute(self._request("hello"))  # default policy, unchanged
+        argv = json.loads(result.stderr.splitlines()[0])
+
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
+        self.assertNotIn("bwrap", argv)
+
+
 if __name__ == "__main__":
     unittest.main()
