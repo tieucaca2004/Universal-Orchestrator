@@ -445,7 +445,7 @@ string label in test fixtures — zero lines of code touch it.
 
 ---
 
-## 9. Milestone History — M1 through M5
+## 9. Milestone History — M1 through M6
 
 **Column note (resolves Founder Review Finding 2):** "Automated tests"
 means the unit/integration suite only, re-run fresh in this review
@@ -465,22 +465,53 @@ claim.
 | M4 — Claude CLI Adapter | `9396e019` | **IMPLEMENTED** | **TESTED** (unit/integration suite, re-run fresh this session) | **VERIFIED (historical)** — real smoke test recorded in `docs/EXECUTION_CLAUDE_CODE.md` at Milestone 4; not re-executed this session (a real paid call, out of scope for a documentation review) |
 | M4 remediation | `9b6e0df8` | **IMPLEMENTED** | **TESTED** (re-run fresh this session) | n/a |
 | M5 — Hermes Adapter | `848129197ce312407e946589920b984e9d8aa2b4` | **IMPLEMENTED** | **TESTED** (unit/integration suite, re-run fresh this session) | **VERIFIED (historical)** — real smoke test recorded in `docs/EXECUTION_HERMES.md` at Milestone 5; not re-executed this session |
+| M6 — Git Worktree Manager, Conflict Manager, Approval Gate, Quality Gate | `b2c723e` .. `751ab3f` (full list in §10 closure record) | **IMPLEMENTED** | **TESTED** (unit/integration suite, re-run fresh — 360/360 pass) | **VERIFIED** — real Claude `WORKTREE_WRITE` direct-tool-use coding, and real Hermes agent coding (create/test/fail/diagnose/fix/retest cycle) inside a disposable per-task sandbox, both pushed through the full governed pipeline (Worktree → Quality Gate → Approval Gate → integration); see §10 closure record |
 
 **VERIFIED today, for this document:** `HEAD == origin/main ==
-848129197ce312407e946589920b984e9d8aa2b4`, working tree clean; full
-suite re-run fresh in this session → **257/257 pass**. No scope,
-history, or commit of M1–M5 was changed — this table only classifies
-what was already there, and the M4/M5 real-smoke-test VERIFIED claims
-are explicitly scoped to historical evidence, not this session's
-activity.
+751ab3ff236443d58916f38ea0048ba6c657ab7c` (pre-closure-commit), working
+tree clean; full suite re-run fresh in this session, twice → **360/360
+pass** both times, 0 failed, 0 skipped. No scope, history, or commit of
+M1–M5 was changed — this table only classifies what was already there,
+and the M4/M5 real-smoke-test VERIFIED claims are explicitly scoped to
+historical evidence, not this session's activity. M6's row reflects
+real-agent acceptance evidence gathered and independently verified in
+this and the immediately preceding sessions (not re-executed again
+solely for this documentation pass, consistent with the M4/M5
+historical-evidence convention above).
 
 ---
 
-## 10. M6 — Execution Governance — **PLANNED, NOT IMPLEMENTED, NOT APPROVED**
+## 10. M6 — Execution Governance — **IMPLEMENTED, TESTED, VERIFIED — COMPLETE / ACCEPTED / CLOSED (Founder decision)**
 
 Serves **Orchestrator A's own execution safety only.** Orchestrator B
 and RTX 3070 hardware are explicitly out of scope for M6 — no component
-below may be implemented in a way that touches either.
+below may be implemented in a way that touches either. This remained
+true throughout M6's implementation and acceptance: nothing in §10
+ever touched Orchestrator B or RTX 3070.
+
+**Closure record.** Founder officially accepted M6 (all four
+components below, plus real-Agent coding acceptance for both Claude
+and Hermes) and authorized this closure. Commits (`b2c723e` 6.1 Git
+Worktree Manager .. `a0dbd75` 6.4 Quality Gate .. `751ab3f` final
+completion item — full range on `main`, chronological):
+`b2c723e, 2754d86, e70a19e, a0dbd75, 412145d, 2e5d510, 08edea9,
+c135a21, 9e27123, d87383c, 0e4be3e, 751ab3f`. Real-Agent acceptance
+evidence (gathered across this and the immediately preceding
+sessions, independently re-verified rather than taken on an agent's
+self-report): Claude `WORKTREE_WRITE` mode creates and edits files
+directly via its own Read/Write/Edit/Bash tools inside a real,
+kernel-enforced sandbox (`bwrap`); Hermes, dispatched through a
+disposable per-task container sandbox (no Docker socket, read-only
+root filesystem, Worktree-only write access), independently created
+source and test files, hit a genuine seeded application-logic test
+failure, diagnosed it, and fixed it via its own `patch` tool before a
+real retest passed — both adapters' output then went through the same
+governed pipeline (Quality Gate, Approval Gate, integration) with no
+step bypassed. Regression: full suite re-run fresh at closure, twice,
+**360/360 pass, 0 failed, 0 skipped**
+(`PYTHONPATH=src python3 -m unittest discover -s tests`). Hermes's
+production container and Telegram Bridge were never modified,
+restarted, or recreated at any point during this work.
 
 ### 10.1 Git Worktree Manager
 - **Objective:** give each execution an isolated, disposable copy of a
@@ -714,7 +745,7 @@ and have not been committed.
 3. **M3 — Project Registry, Agent Registry, Provider Registry, Agent Router.** DECIDED, IMPLEMENTED, TESTED (re-run fresh this session).
 4. **M4 — Claude CLI Adapter and non-interactive execution verification.** DECIDED, IMPLEMENTED, TESTED (unit/integration, this session); VERIFIED (historical real smoke test, not re-run this session). **Kept, not removed** — see §D.
 5. **M5 — Hermes Adapter and execution verification.** DECIDED, IMPLEMENTED, TESTED (unit/integration, this session); VERIFIED (historical real smoke test, not re-run this session). **Kept, not removed** — see §D.
-6. **M6 — Git Worktree Manager, Conflict Manager, Approval Gate, Quality Gate.** PLANNED, NOT APPROVED, NOT IMPLEMENTED. Serves Orchestrator A only.
+6. **M6 — Git Worktree Manager, Conflict Manager, Approval Gate, Quality Gate.** IMPLEMENTED, TESTED, VERIFIED. **COMPLETE / ACCEPTED / CLOSED** (Founder decision) — see §9, §10. Serves Orchestrator A only.
 7. **M7 — NOT APPROVED.** Scope requires architecture review and explicit Founder approval.
 8. **M8 — End-to-end testing, backup, recovery, final acceptance.** PLANNED (provisional shape only), NOT APPROVED, NOT IMPLEMENTED; gated on M6 and M7.
 
@@ -723,6 +754,7 @@ and have not been committed.
 
 ---
 
-*This document was prepared for Founder review. It has not been
-committed or pushed. No source code, test, configuration, secret, or
-runtime data was changed while preparing it.*
+*This document was prepared for Founder review and, for this M6
+closure update, committed and pushed to `origin/main` per Founder's
+explicit M6 acceptance decision. No source code, test, configuration,
+secret, or runtime data was changed while preparing it.*
