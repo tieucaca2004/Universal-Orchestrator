@@ -4,9 +4,22 @@ from pathlib import Path
 
 from universal_orchestrator.analysis.analyzer import TaskAnalyzer
 from universal_orchestrator.core.engine import OrchestrationEngine
-from universal_orchestrator.core.models import ProjectProfile, TaskRequest, TaskStatus
+from universal_orchestrator.core.models import (
+    AgentDescriptor,
+    AgentStatus,
+    ProjectProfile,
+    ProviderDescriptor,
+    ProviderStatus,
+    RoutingOutcome,
+    TaskRequest,
+    TaskStatus,
+)
 from universal_orchestrator.core.state import StateManager
 from universal_orchestrator.errors import NotFoundError
+from universal_orchestrator.registry.agents import AgentRegistry
+from universal_orchestrator.registry.projects import ProjectRegistry
+from universal_orchestrator.registry.providers import ProviderRegistry
+from universal_orchestrator.routing.router import AgentRouter
 
 
 class _BrokenAnalyzer(TaskAnalyzer):
@@ -94,6 +107,105 @@ class FailurePropagationTests(EngineTestCase):
         engine = OrchestrationEngine.bootstrap(self.state)
         with self.assertRaises(NotFoundError):
             engine.submit(self._request(), self.profile, depends_on=("task_missing",))
+
+
+class RoutingIntegrationTests(EngineTestCase):
+    """Project Registry -> Analyzer -> (Manager) -> Router -> Manager,
+    exactly the Milestone 3 flow: a profile looked up from a registry
+    feeds the Analyzer and, separately, the Router."""
+
+    def setUp(self):
+        super().setUp()
+        self.projects = ProjectRegistry()
+        self.agents = AgentRegistry()
+        self.providers = ProviderRegistry()
+
+    def _registered_profile(self, **overrides):
+        return self.projects.register(ProjectProfile(**{**overrides, **{
+            "name": overrides.get("name", "demo"),
+            "repository_path": overrides.get("repository_path", "/workspace/demo"),
+        }}))
+
+    def _available_agent(self, **overrides):
+        defaults = {"name": "coder-a", "role": "coder", "capabilities": ["python"]}
+        defaults.update(overrides)
+        agent = self.agents.register(AgentDescriptor(**defaults))
+        self.agents.set_status(agent.agent_id, AgentStatus.AVAILABLE)
+        return agent
+
+    def _verified_provider(self, **overrides):
+        defaults = {"name": "anthropic", "kind": "api"}
+        defaults.update(overrides)
+        provider = self.providers.register(ProviderDescriptor(**defaults))
+        self.providers.set_verified(provider.provider_id, True)
+        self.providers.set_status(provider.provider_id, ProviderStatus.AVAILABLE)
+        return provider
+
+    def test_profile_from_registry_feeds_the_analyzer(self):
+        profile = self._registered_profile(name="demo")
+        engine = OrchestrationEngine.bootstrap(self.state)
+
+        task = engine.submit(self._request(), self.projects.get(profile.project_id))
+
+        self.assertEqual(task.project_id, profile.project_id)
+        self.assertIsNotNone(task.specification)
+
+    def test_submit_then_route_selects_an_eligible_agent_and_persists_the_decision(self):
+        profile = self._registered_profile()
+        provider = self._verified_provider()
+        agent = self._available_agent(provider_id=provider.provider_id)
+        router = AgentRouter(self.agents, self.providers)
+        engine = OrchestrationEngine.bootstrap(self.state, router=router)
+
+        task = engine.submit(self._request(), profile)
+        decision = engine.route(task.task_id, profile)
+
+        self.assertIs(decision.outcome, RoutingOutcome.SELECTED)
+        self.assertEqual(decision.selected_agent_id, agent.agent_id)
+
+        persisted = engine.manager.get_routing_decisions(task.task_id)
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(persisted[0].selected_agent_id, agent.agent_id)
+
+    def test_routing_does_not_change_task_status(self):
+        profile = self._registered_profile()
+        provider = self._verified_provider()
+        self._available_agent(provider_id=provider.provider_id)
+        router = AgentRouter(self.agents, self.providers)
+        engine = OrchestrationEngine.bootstrap(self.state, router=router)
+
+        task = engine.submit(self._request(), profile)
+        status_before = task.status
+        engine.route(task.task_id, profile)
+
+        self.assertIs(engine.manager.get(task.task_id).status, status_before)
+
+    def test_no_eligible_agent_still_persists_an_explainable_decision(self):
+        profile = self._registered_profile()
+        router = AgentRouter(self.agents, self.providers)
+        engine = OrchestrationEngine.bootstrap(self.state, router=router)
+
+        task = engine.submit(self._request(), profile)
+        decision = engine.route(task.task_id, profile)
+
+        self.assertIs(decision.outcome, RoutingOutcome.NO_ELIGIBLE_AGENT)
+        self.assertEqual(engine.manager.get_routing_decisions(task.task_id)[0].outcome, decision.outcome)
+
+    def test_routing_without_a_configured_router_raises(self):
+        profile = self._registered_profile()
+        engine = OrchestrationEngine.bootstrap(self.state)  # no router
+        task = engine.submit(self._request(), profile)
+
+        with self.assertRaises(RuntimeError):
+            engine.route(task.task_id, profile)
+
+    def test_routing_an_unknown_task_propagates_not_found(self):
+        profile = self._registered_profile()
+        router = AgentRouter(self.agents, self.providers)
+        engine = OrchestrationEngine.bootstrap(self.state, router=router)
+
+        with self.assertRaises(NotFoundError):
+            engine.route("task_missing", profile)
 
 
 if __name__ == "__main__":

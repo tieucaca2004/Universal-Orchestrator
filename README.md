@@ -10,10 +10,13 @@ by absorbing or copying them.
 
 ## Status
 
-Milestone 2 — Task Analyzer, Task Manager and State Manager. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for the component map, roadmap and open
-architectural questions, and [docs/TASK_LIFECYCLE.md](docs/TASK_LIFECYCLE.md)
-for the task state machine.
+Milestone 3 — Project Registry, Agent Registry, Provider Registry and
+Agent Router. See [ARCHITECTURE.md](ARCHITECTURE.md) for the component
+map, the Founder-approved 8-milestone roadmap, and open architectural
+questions; [docs/TASK_LIFECYCLE.md](docs/TASK_LIFECYCLE.md) for the task
+state machine; [docs/REGISTRIES.md](docs/REGISTRIES.md) for the registry
+schemas; and [docs/ROUTING.md](docs/ROUTING.md) for the routing
+algorithm.
 
 ## Stack
 
@@ -31,15 +34,21 @@ src/universal_orchestrator/
   analysis/    Task Analyzer — TaskRequest -> TaskSpecification
   core/        data models, task lifecycle rules, Task Manager,
                State Manager (SQLite), orchestration engine
-  registry/    project, agent and provider registries (Milestone 3)
+  registry/    project, agent and provider registries
+  routing/     Agent Router — selects who should perform a task
   planning/    task planner and dispatcher interfaces
   execution/   execution adapter interface (Claude Code, Gemini CLI,
                DeepSeek, Kimi, OpenClaw, Hermes, future RTX 3070 worker)
-  approval/    approval gate for sensitive operations (Milestone 4)
-  audit/       structured logging (full audit trail in Milestone 4)
+  approval/    approval gate for sensitive operations (a later milestone)
+  audit/       structured logging (full audit trail in a later milestone)
   config/      configuration management
   errors.py    shared exception hierarchy
 ```
+
+Note: the Milestone 3 brief specified `src/orchestrator/...`; this
+repository has used `src/universal_orchestrator/...` since Milestone 1.
+See ARCHITECTURE.md's "Open architectural questions" for why that naming
+was kept rather than mass-renamed.
 
 ## Running tests
 

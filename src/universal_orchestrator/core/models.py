@@ -51,11 +51,40 @@ TERMINAL_TASK_STATUSES = frozenset(
 
 @dataclass(slots=True)
 class ProjectProfile:
+    """Everything the Task Analyzer, Task Manager and Agent Router need to
+    know about one project — never fabricated, never hardcoded to a path
+    on this machine. See `registry.projects.load_from_config` for how a
+    Founder-supplied config file becomes a list of these."""
+
     name: str
     repository_path: str
     project_id: str = field(default_factory=lambda: _new_id("proj"))
     description: str = ""
+    repository_url: str = ""
+    main_branch: str = "main"
+    technology_stack: list[str] = field(default_factory=list)
+    instructions: list[str] = field(default_factory=list)
+    allowed_operations: list[str] = field(default_factory=list)
+    restricted_operations: list[str] = field(default_factory=list)
+    acceptance_criteria: list[str] = field(default_factory=list)
+    required_testing_commands: list[str] = field(default_factory=list)
+    security_constraints: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class AgentStatus(enum.Enum):
+    """An agent's operational state, as distinct from merely existing in
+    the registry. See ARCHITECTURE.md "Agent status semantics" — only
+    `AVAILABLE` is ever eligible for routing; every other value, unknown
+    values included, is treated as not-available."""
+
+    REGISTERED = "registered"
+    AVAILABLE = "available"
+    BUSY = "busy"
+    OFFLINE = "offline"
+    UNVERIFIED = "unverified"
+    DISABLED = "disabled"
+    ERROR = "error"
 
 
 @dataclass(slots=True)
@@ -64,7 +93,47 @@ class AgentDescriptor:
     role: str
     agent_id: str = field(default_factory=lambda: _new_id("agent"))
     provider_id: str | None = None
+    # Registering an agent always starts it at REGISTERED — existing in
+    # configuration is not evidence of being operational. See
+    # registry.agents.AgentRegistry.register.
+    status: AgentStatus = AgentStatus.REGISTERED
+    capabilities: list[str] = field(default_factory=list)
+    supported_task_types: list[str] = field(default_factory=list)
+    permissions: list[str] = field(default_factory=list)
+    # Logical label only ("NUC", "RTX3070", ...) — never a real hostname,
+    # IP or path. See ARCHITECTURE.md "Open architectural questions".
+    machine: str | None = None
+    execution_environment: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class ProviderStatus(enum.Enum):
+    """Reachability, as distinct from `ProviderDescriptor.verified`
+    (authentication/execution correctness). A provider can be reachable
+    but unverified, or verified-in-the-past but currently unreachable."""
+
+    UNKNOWN = "unknown"
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    ERROR = "error"
+
+
+class CostConfidence(enum.Enum):
+    """How much to trust `CostInfo`'s numbers. Never treat ESTIMATED or
+    UNKNOWN as a reliable constraint — see routing.router's cost check."""
+
+    VERIFIED = "verified"
+    ESTIMATED = "estimated"
+    UNKNOWN = "unknown"
+
+
+@dataclass(slots=True)
+class CostInfo:
+    confidence: CostConfidence = CostConfidence.UNKNOWN
+    input_per_1k_tokens: float | None = None
+    output_per_1k_tokens: float | None = None
+    currency: str = "USD"
+    notes: str = ""
 
 
 @dataclass(slots=True)
@@ -76,6 +145,13 @@ class ProviderDescriptor:
     # against the live provider has succeeded. Nothing may dispatch to a
     # provider while this is False (see errors.ProviderNotVerifiedError).
     verified: bool = False
+    status: ProviderStatus = ProviderStatus.UNKNOWN
+    model_id: str | None = None
+    execution_method: str | None = None
+    capabilities: list[str] = field(default_factory=list)
+    # Never a credential: this model has no field for one, deliberately —
+    # see ARCHITECTURE.md "Provider Registry" on why.
+    cost: CostInfo = field(default_factory=CostInfo)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -132,6 +208,37 @@ class Constitution:
 
     rules: list[str] = field(default_factory=list)
     source: str = "inline"
+
+
+class RoutingOutcome(enum.Enum):
+    SELECTED = "selected"
+    NO_ELIGIBLE_AGENT = "no_eligible_agent"
+
+
+@dataclass(slots=True)
+class RejectedCandidate:
+    agent_id: str
+    reasons: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class RoutingDecision:
+    """The Agent Router's explainable output. Persisted by the Task
+    Manager (`TaskManager.record_routing_decision`) in its own table —
+    never written onto the `Task` row itself, so a routing decision can
+    never corrupt task history. See docs/ROUTING.md."""
+
+    task_id: str
+    project_id: str
+    outcome: RoutingOutcome
+    explanation: str
+    decision_id: str = field(default_factory=lambda: _new_id("route"))
+    selected_agent_id: str | None = None
+    selected_provider_id: str | None = None
+    matched_capabilities: list[str] = field(default_factory=list)
+    rejected: list[RejectedCandidate] = field(default_factory=list)
+    score: float | None = None
+    decided_at: datetime = field(default_factory=_utcnow)
 
 
 @dataclass(slots=True)

@@ -32,30 +32,33 @@ repository.
 
 | # | Component | Module | Status |
 |---|---|---|---|
-| 1 | Orchestration Engine | `core/engine.py` | **Done** (Milestone 2 scope: Analyzer → Manager → State only — no Agent Router, Dispatcher, or adapter wiring) |
+| 1 | Orchestration Engine | `core/engine.py` | **Done** (Analyzer → Manager → State, and now → Router; no Dispatcher or adapter wiring) |
 | 1a | Task Analyzer | `analysis/analyzer.py` | **Done** |
 | 1b | Task Manager | `core/task_manager.py`, `core/lifecycle.py` | **Done** |
-| 2 | Project Profile Registry | `registry/projects.py` | Milestone 3 |
-| 3 | Agent Registry | `registry/agents.py` | Milestone 3 |
-| 4 | Provider Registry | `registry/providers.py` | Milestone 3 |
+| 2 | Project Profile Registry | `registry/projects.py` | **Done** — see [docs/REGISTRIES.md](docs/REGISTRIES.md) |
+| 3 | Agent Registry | `registry/agents.py` | **Done** — see [docs/REGISTRIES.md](docs/REGISTRIES.md) |
+| 4 | Provider Registry | `registry/providers.py` | **Done** — see [docs/REGISTRIES.md](docs/REGISTRIES.md) |
+| 4a | Agent Router | `routing/router.py` | **Done** — see [docs/ROUTING.md](docs/ROUTING.md) |
 | 5 | Task Lifecycle + persistent state | `core/models.py`, `core/lifecycle.py`, `core/state.py` (SQLite) | **Done** — see [docs/TASK_LIFECYCLE.md](docs/TASK_LIFECYCLE.md) |
 | 6 | Task Planner interface | `planning/planner.py` | **Done** (interface) |
 | 7 | Dispatcher interface | `planning/dispatcher.py` | **Done** (interface) |
-| 8 | Execution Adapter interface | `execution/adapter.py` | **Done** (interface); concrete adapters in Milestone 5 |
-| 9 | Structured logging / audit trail | `audit/logger.py` (logging, done), full audit trail Milestone 4 |
+| 8 | Execution Adapter interface | `execution/adapter.py` | **Done** (interface); concrete adapters in Milestone 5 (per this repo's internal numbering — Milestones 4–5 in the Founder's authoritative roadmap below) |
+| 9 | Structured logging / audit trail | `audit/logger.py` (logging, done), full audit trail in a later milestone |
 | 10 | Configuration management | `config/settings.py` | **Done** |
 | 11 | Error handling & recovery | `errors.py` | **Done** |
-| 12 | Unit / integration tests | `tests/` | Ongoing; full coverage at Milestone 6 |
+| 12 | Unit / integration tests | `tests/` | Ongoing; 140/140 passing as of Milestone 3 |
 
 Components marked "Done" are real, tested code. Everything else is either a
 genuine interface (6, 7, 8 — explicitly scoped as interfaces) or an empty,
-clearly-labelled placeholder module naming the milestone that implements
-it (2, 3, 4, and the Approval Gate). Nothing claims to work before it does.
+clearly-labelled placeholder module naming the milestone that implements it
+(the Approval Gate). Nothing claims to work before it does.
 
 The Task Manager explicitly does **not** decide which agent or provider
-executes a task — that is the Agent Router's job (Milestone 3+). It only
-asks "is this transition allowed" and "is this task's dependency graph
-satisfied".
+executes a task — that is the Agent Router's job, implemented this
+milestone. The Router, in turn, only ever *selects*: it reads the
+registries, evaluates eligibility, and returns an explainable
+`RoutingDecision` — it never calls a provider, never starts a Git
+worktree, and never contacts a machine. See [docs/ROUTING.md](docs/ROUTING.md).
 
 ## Provider verification policy
 
@@ -76,12 +79,19 @@ Milestone 4 lands, no adapter may perform such actions at all.
 
 ## Roadmap
 
-1. Architecture and repository foundation — **done**.
-2. Task Analyzer, Task Manager, State Manager (SQLite) — **done**.
-3. Project and agent registries.
-4. Approval gate and audit trail.
-5. Execution adapter interfaces → first concrete adapter(s).
-6. Tests, documentation and integration verification.
+This is the Founder-approved milestone sequence, corrected here per the
+Milestone 3 brief — earlier reports in this repository's history used a
+different, shorter 6-item roadmap that this section now supersedes. This
+sequence must not change without Founder approval.
+
+1. **M1 — Repository Foundation.** **Done.**
+2. **M2 — Task Analyzer, Task Manager, State Manager.** **Done.**
+3. **M3 — Project Registry, Agent Registry, Provider Registry, Agent Router.** **Done.**
+4. **M4 — Claude CLI Adapter and non-interactive execution verification.**
+5. **M5 — Hermes Adapter and execution verification.**
+6. **M6 — Git Worktree, Conflict Manager, Approval Gate and Quality Gate.**
+7. **M7 — Worker Protocol and RTX 3070 integration.**
+8. **M8 — End-to-end testing, backup, recovery and final acceptance.**
 
 ## Open architectural questions for Founder review
 
@@ -113,3 +123,26 @@ audit for how each was found.
    and a `ProjectProfile` instead of reading `PROJECT_PROFILES.md` —
    if/when those files are written, a loader can be added without
    changing the Analyzer's interface.
+3. **Path naming in the Milestone 3 brief does not match this
+   repository.** The brief specifies `src/orchestrator/registry/*.py`
+   and `src/orchestrator/routing/router.py`; this repository's package
+   has been `src/universal_orchestrator/` since Milestone 1
+   (`pyproject.toml`'s `name = "universal-orchestrator"`, 20+ existing
+   files importing it). Renaming the package to match would touch every
+   file in the repository for no functional benefit and is exactly the
+   kind of change Milestone 2's directive warned against ("do not
+   redesign without demonstrated technical necessity"). This milestone's
+   four components were implemented at
+   `src/universal_orchestrator/registry/{projects,agents,providers}.py`
+   and `src/universal_orchestrator/routing/router.py` instead. Flagging
+   for Founder confirmation rather than silently picking one path.
+4. **NUC/RTX-3070 agent role assignments are architecture, not proof.**
+   This milestone's brief repeats the Claude-on-NUC /
+   Hermes-on-RTX3070 role split as established fact. Per open question 1
+   above, neither machine's availability is verified, and this
+   repository ships **no pre-registered agents or providers** — the
+   `AgentRegistry` and `ProviderRegistry` start empty; any NUC/RTX3070
+   agent descriptors in the test suite are illustrative test data only,
+   never seeded into production code, and `AgentDescriptor.machine` is a
+   logical label chosen by whoever calls `register()`, never a verified
+   fact about real hardware.

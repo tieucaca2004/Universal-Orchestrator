@@ -16,7 +16,15 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
-from universal_orchestrator.core.models import Task, TaskError, TaskSpecification, TaskStatus
+from universal_orchestrator.core.models import (
+    RejectedCandidate,
+    RoutingDecision,
+    RoutingOutcome,
+    Task,
+    TaskError,
+    TaskSpecification,
+    TaskStatus,
+)
 from universal_orchestrator.errors import DuplicateError, NotFoundError
 
 _SCHEMA = """
@@ -41,6 +49,24 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_parent_id ON tasks(parent_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+
+-- Routing decisions are their own table, deliberately: the Agent Router
+-- never writes to `tasks`, so a routing decision can never corrupt a
+-- task's row or history (see Milestone 3 / docs/ROUTING.md).
+CREATE TABLE IF NOT EXISTS routing_decisions (
+    decision_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    explanation TEXT NOT NULL,
+    selected_agent_id TEXT,
+    selected_provider_id TEXT,
+    matched_capabilities TEXT NOT NULL DEFAULT '[]',
+    rejected TEXT NOT NULL DEFAULT '[]',
+    score REAL,
+    decided_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_routing_decisions_task_id ON routing_decisions(task_id);
 """
 
 _COLUMNS = (
@@ -136,6 +162,40 @@ class StateManager:
         cursor = self._conn.execute(query, params)
         return [_row_to_task(row) for row in cursor.fetchall()]
 
+    # -- routing decisions -----------------------------------------------------
+
+    def save_routing_decision(self, decision: RoutingDecision) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO routing_decisions (
+                    decision_id, task_id, project_id, outcome, explanation,
+                    selected_agent_id, selected_provider_id,
+                    matched_capabilities, rejected, score, decided_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision.decision_id,
+                    decision.task_id,
+                    decision.project_id,
+                    decision.outcome.value,
+                    decision.explanation,
+                    decision.selected_agent_id,
+                    decision.selected_provider_id,
+                    json.dumps(decision.matched_capabilities),
+                    json.dumps([asdict(r) for r in decision.rejected]),
+                    decision.score,
+                    decision.decided_at.isoformat(),
+                ),
+            )
+
+    def get_routing_decisions(self, task_id: str) -> list[RoutingDecision]:
+        cursor = self._conn.execute(
+            "SELECT * FROM routing_decisions WHERE task_id = ? ORDER BY decided_at",
+            (task_id,),
+        )
+        return [_row_to_routing_decision(row) for row in cursor.fetchall()]
+
 
 def _task_to_row(task: Task) -> dict[str, object]:
     return {
@@ -180,4 +240,20 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         history=[tuple(entry) for entry in json.loads(row["history"])],
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+def _row_to_routing_decision(row: sqlite3.Row) -> RoutingDecision:
+    return RoutingDecision(
+        decision_id=row["decision_id"],
+        task_id=row["task_id"],
+        project_id=row["project_id"],
+        outcome=RoutingOutcome(row["outcome"]),
+        explanation=row["explanation"],
+        selected_agent_id=row["selected_agent_id"],
+        selected_provider_id=row["selected_provider_id"],
+        matched_capabilities=json.loads(row["matched_capabilities"]),
+        rejected=[RejectedCandidate(**entry) for entry in json.loads(row["rejected"])],
+        score=row["score"],
+        decided_at=datetime.fromisoformat(row["decided_at"]),
     )

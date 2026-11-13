@@ -4,6 +4,9 @@ import unittest
 from pathlib import Path
 
 from universal_orchestrator.core.models import (
+    RejectedCandidate,
+    RoutingDecision,
+    RoutingOutcome,
     Task,
     TaskError,
     TaskSpecification,
@@ -166,6 +169,68 @@ class DataIntegrityTests(StateManagerTestCase):
         loaded = self.state.get(task.task_id)
         self.assertEqual(loaded.result, {"exit_code": 0, "output": "ok"})
         self.assertEqual(loaded.error.code, "e")
+
+
+class RoutingDecisionPersistenceTests(StateManagerTestCase):
+    def test_save_then_get_round_trips_a_selected_decision(self):
+        task = Task(title="t", project_id="proj_a")
+        self.state.create(task)
+        decision = RoutingDecision(
+            task_id=task.task_id,
+            project_id="proj_a",
+            outcome=RoutingOutcome.SELECTED,
+            explanation="selected agent_x",
+            selected_agent_id="agent_x",
+            selected_provider_id="prov_y",
+            matched_capabilities=["python"],
+            rejected=[RejectedCandidate("agent_z", ["offline"])],
+            score=1.0,
+        )
+
+        self.state.save_routing_decision(decision)
+        loaded = self.state.get_routing_decisions(task.task_id)
+
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].selected_agent_id, "agent_x")
+        self.assertEqual(loaded[0].rejected, [RejectedCandidate("agent_z", ["offline"])])
+        self.assertEqual(loaded[0].score, 1.0)
+
+    def test_saving_a_routing_decision_does_not_change_the_task_row(self):
+        task = Task(title="t", project_id="proj_a")
+        self.state.create(task)
+        before = self.state.get(task.task_id)
+
+        self.state.save_routing_decision(
+            RoutingDecision(
+                task_id=task.task_id,
+                project_id="proj_a",
+                outcome=RoutingOutcome.NO_ELIGIBLE_AGENT,
+                explanation="no eligible agent",
+            )
+        )
+
+        after = self.state.get(task.task_id)
+        self.assertEqual(after.status, before.status)
+        self.assertEqual(after.history, before.history)
+        self.assertEqual(after.updated_at, before.updated_at)
+
+    def test_multiple_decisions_for_the_same_task_are_all_kept(self):
+        task = Task(title="t", project_id="proj_a")
+        self.state.create(task)
+        for i in range(2):
+            self.state.save_routing_decision(
+                RoutingDecision(
+                    task_id=task.task_id,
+                    project_id="proj_a",
+                    outcome=RoutingOutcome.NO_ELIGIBLE_AGENT,
+                    explanation=f"attempt {i}",
+                )
+            )
+
+        self.assertEqual(len(self.state.get_routing_decisions(task.task_id)), 2)
+
+    def test_no_decisions_returns_empty_list(self):
+        self.assertEqual(self.state.get_routing_decisions("task_missing"), [])
 
 
 if __name__ == "__main__":

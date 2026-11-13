@@ -17,7 +17,13 @@ import enum
 from datetime import datetime, timezone
 
 from universal_orchestrator.core import lifecycle
-from universal_orchestrator.core.models import Task, TaskError, TaskSpecification, TaskStatus
+from universal_orchestrator.core.models import (
+    RoutingDecision,
+    Task,
+    TaskError,
+    TaskSpecification,
+    TaskStatus,
+)
 from universal_orchestrator.core.state import StateManager
 from universal_orchestrator.errors import NotFoundError, OrchestratorError
 
@@ -55,6 +61,17 @@ class TaskManager:
 
     def list_children(self, parent_id: str) -> list[Task]:
         return [t for t in self._tasks.values() if t.parent_id == parent_id]
+
+    def record_routing_decision(self, decision: RoutingDecision) -> None:
+        """The only path a `RoutingDecision` reaches storage through —
+        the Agent Router returns a decision but never persists it
+        itself, so it can never bypass the Task Manager."""
+        self._require(decision.task_id)
+        self._state.save_routing_decision(decision)
+
+    def get_routing_decisions(self, task_id: str) -> list[RoutingDecision]:
+        self._require(task_id)
+        return self._state.get_routing_decisions(task_id)
 
     def _require(self, task_id: str) -> Task:
         task = self._tasks.get(task_id)
