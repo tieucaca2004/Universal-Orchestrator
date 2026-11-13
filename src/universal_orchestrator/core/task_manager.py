@@ -25,8 +25,9 @@ from universal_orchestrator.core.models import (
     TaskStatus,
 )
 from universal_orchestrator.core.state import StateManager
-from universal_orchestrator.errors import NotFoundError, OrchestratorError
+from universal_orchestrator.errors import NotFoundError, OrchestratorError, QualityGateRequiredError
 from universal_orchestrator.execution.adapter import ExecutionResult
+from universal_orchestrator.execution.quality import QualityVerdict
 
 
 class InterruptedResolution(enum.Enum):
@@ -197,7 +198,25 @@ class TaskManager:
         return task
 
     def succeed(self, task_id: str, result: object | None = None) -> Task:
+        """Milestone 6.4: a task may never reach SUCCEEDED without a
+        recorded, task-level Quality Gate PASS tied to its own
+        acceptance criteria — a completed process alone has never been
+        sufficient evidence (see `execution.adapter.ExecutionResult
+        .success`'s own docstring, unchanged since Milestone 4).
+
+        The transition's own validity is checked first (via
+        `lifecycle.validate_transition`, the same check `_transition`
+        performs) so an already-wrong-state call still raises
+        `InvalidStateTransitionError`, exactly as before this
+        milestone — the Quality Gate requirement is an additional
+        precondition, not a replacement for the existing one."""
         task = self._require(task_id)
+        lifecycle.validate_transition(task.status, TaskStatus.SUCCEEDED)
+        verdict_report = self._state.latest_quality_report(task_id, level="task")
+        if verdict_report is None or verdict_report.verdict is not QualityVerdict.PASS:
+            raise QualityGateRequiredError(
+                task_id, verdict_report.verdict.value if verdict_report else "NOT_VERIFIED"
+            )
         self._transition(task, TaskStatus.SUCCEEDED)
         task.result = result
         self._persist(task)

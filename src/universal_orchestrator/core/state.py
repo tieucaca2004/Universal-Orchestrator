@@ -38,6 +38,7 @@ from universal_orchestrator.execution.approval import (
     IntegrationProposal,
 )
 from universal_orchestrator.execution.conflict import ConflictReport
+from universal_orchestrator.execution.quality import QualityReport, QualityVerdict
 from universal_orchestrator.execution.worktree import WorktreeHandle, WorktreeStatus
 
 _SCHEMA = """
@@ -180,6 +181,24 @@ CREATE TABLE IF NOT EXISTS approval_decisions (
     decided_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_approval_decisions_task_id ON approval_decisions(task_id);
+
+-- Milestone 6.4: task-level and integration-level verdicts share one
+-- table, distinguished by `level` — never conflated (a query always
+-- filters by level explicitly; see TaskManager.succeed()'s use of
+-- level="task" specifically).
+CREATE TABLE IF NOT EXISTS quality_reports (
+    report_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    level TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    rationale TEXT NOT NULL DEFAULT '',
+    criteria_evidence TEXT NOT NULL DEFAULT '{}',
+    commands_run TEXT NOT NULL DEFAULT '[]',
+    command_results TEXT NOT NULL DEFAULT '[]',
+    evaluated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_quality_reports_task_id ON quality_reports(task_id);
+CREATE INDEX IF NOT EXISTS idx_quality_reports_level ON quality_reports(level);
 """
 
 _COLUMNS = (
@@ -598,6 +617,46 @@ class StateManager:
         )
         return [_row_to_approval_decision(row) for row in cursor.fetchall()]
 
+    # -- quality reports (Milestone 6.4) ---------------------------------------
+
+    def save_quality_report(self, report: QualityReport) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO quality_reports (
+                    report_id, task_id, level, verdict, rationale,
+                    criteria_evidence, commands_run, command_results, evaluated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    report.report_id,
+                    report.task_id,
+                    report.level,
+                    report.verdict.value,
+                    report.rationale,
+                    json.dumps(report.criteria_evidence),
+                    json.dumps(report.commands_run),
+                    json.dumps(report.command_results),
+                    report.evaluated_at.isoformat(),
+                ),
+            )
+
+    def get_quality_reports(self, task_id: str) -> list[QualityReport]:
+        cursor = self._conn.execute(
+            "SELECT * FROM quality_reports WHERE task_id = ? ORDER BY evaluated_at",
+            (task_id,),
+        )
+        return [_row_to_quality_report(row) for row in cursor.fetchall()]
+
+    def latest_quality_report(self, task_id: str, level: str) -> QualityReport | None:
+        cursor = self._conn.execute(
+            "SELECT * FROM quality_reports WHERE task_id = ? AND level = ? "
+            "ORDER BY evaluated_at DESC LIMIT 1",
+            (task_id, level),
+        )
+        row = cursor.fetchone()
+        return _row_to_quality_report(row) if row is not None else None
+
 
 def _task_to_row(task: Task) -> dict[str, object]:
     return {
@@ -741,4 +800,18 @@ def _row_to_approval_decision(row: sqlite3.Row) -> ApprovalDecision:
         decision=ApprovalDecisionType(row["decision"]),
         reason=row["reason"],
         decided_at=datetime.fromisoformat(row["decided_at"]),
+    )
+
+
+def _row_to_quality_report(row: sqlite3.Row) -> QualityReport:
+    return QualityReport(
+        report_id=row["report_id"],
+        task_id=row["task_id"],
+        level=row["level"],
+        verdict=QualityVerdict(row["verdict"]),
+        rationale=row["rationale"],
+        criteria_evidence=json.loads(row["criteria_evidence"]),
+        commands_run=json.loads(row["commands_run"]),
+        command_results=json.loads(row["command_results"]),
+        evaluated_at=datetime.fromisoformat(row["evaluated_at"]),
     )

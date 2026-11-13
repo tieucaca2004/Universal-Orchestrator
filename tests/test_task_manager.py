@@ -5,7 +5,13 @@ from pathlib import Path
 from universal_orchestrator.core.models import TaskError, TaskSpecification, TaskStatus
 from universal_orchestrator.core.state import StateManager
 from universal_orchestrator.core.task_manager import InterruptedResolution, TaskManager
-from universal_orchestrator.errors import InvalidStateTransitionError, NotFoundError, OrchestratorError
+from universal_orchestrator.errors import (
+    InvalidStateTransitionError,
+    NotFoundError,
+    OrchestratorError,
+    QualityGateRequiredError,
+)
+from universal_orchestrator.execution.quality import QualityReport, QualityVerdict
 
 
 def _spec(**overrides):
@@ -23,6 +29,22 @@ class TaskManagerTestCase(unittest.TestCase):
     def tearDown(self):
         self.state.close()
         self._tmpdir.cleanup()
+
+    def _pass_quality_gate(self, task_id: str) -> None:
+        """Milestone 6.4: `succeed()` now requires a recorded,
+        task-level Quality Gate PASS. These fixtures are about Task
+        Manager behavior (dependency cascading, result recording, ...),
+        not about Quality Gate evaluation itself — see
+        tests/test_quality_gate.py for that — so this helper records
+        the precondition directly rather than re-deriving it."""
+        self.state.save_quality_report(
+            QualityReport(
+                task_id=task_id,
+                level="task",
+                verdict=QualityVerdict.PASS,
+                rationale="test fixture",
+            )
+        )
 
 
 class CreationTests(TaskManagerTestCase):
@@ -82,6 +104,7 @@ class DependencyTests(TaskManagerTestCase):
         self.assertIs(self.manager.get(b.task_id).status, TaskStatus.BLOCKED)
 
         self.manager.start(a.task_id)
+        self._pass_quality_gate(a.task_id)
         self.manager.succeed(a.task_id, result="done")
 
         self.assertIs(self.manager.get(b.task_id).status, TaskStatus.READY)
@@ -98,6 +121,7 @@ class DependencyTests(TaskManagerTestCase):
         self.assertIs(self.manager.get(c.task_id).status, TaskStatus.BLOCKED)
 
         self.manager.start(a.task_id)
+        self._pass_quality_gate(a.task_id)
         self.manager.succeed(a.task_id)
         self.assertIs(
             self.manager.get(c.task_id).status,
@@ -106,6 +130,7 @@ class DependencyTests(TaskManagerTestCase):
         )
 
         self.manager.start(b.task_id)
+        self._pass_quality_gate(b.task_id)
         self.manager.succeed(b.task_id)
         self.assertIs(self.manager.get(c.task_id).status, TaskStatus.READY)
 
@@ -147,9 +172,38 @@ class InvalidTransitionTests(TaskManagerTestCase):
         task = self.manager.create_task("t", "proj_a")
         self.manager.attach_specification(task.task_id, _spec())
         self.manager.start(task.task_id)
+        self._pass_quality_gate(task.task_id)
         self.manager.succeed(task.task_id)
         with self.assertRaises(InvalidStateTransitionError):
             self.manager.start(task.task_id)
+
+    def test_cannot_succeed_without_a_recorded_quality_gate_pass(self):
+        """Milestone 6.4: the task is otherwise perfectly eligible to
+        succeed (RUNNING, valid transition target) — the only thing
+        missing is a recorded Quality Gate verdict. A completed
+        process is never, by itself, sufficient."""
+        task = self.manager.create_task("t", "proj_a")
+        self.manager.attach_specification(task.task_id, _spec())
+        self.manager.start(task.task_id)
+        with self.assertRaises(QualityGateRequiredError):
+            self.manager.succeed(task.task_id)
+        # Refusal must not have silently advanced the task's status.
+        self.assertIs(self.manager.get(task.task_id).status, TaskStatus.RUNNING)
+
+    def test_cannot_succeed_with_a_fail_or_not_verified_quality_gate_result(self):
+        task = self.manager.create_task("t", "proj_a")
+        self.manager.attach_specification(task.task_id, _spec())
+        self.manager.start(task.task_id)
+        self.state.save_quality_report(
+            QualityReport(
+                task_id=task.task_id,
+                level="task",
+                verdict=QualityVerdict.FAIL,
+                rationale="test fixture",
+            )
+        )
+        with self.assertRaises(QualityGateRequiredError):
+            self.manager.succeed(task.task_id)
 
 
 class RecoveryTests(TaskManagerTestCase):
@@ -232,6 +286,7 @@ class ResultAndErrorRecordingTests(TaskManagerTestCase):
         task = self.manager.create_task("t", "proj_a")
         self.manager.attach_specification(task.task_id, _spec())
         self.manager.start(task.task_id)
+        self._pass_quality_gate(task.task_id)
 
         succeeded = self.manager.succeed(task.task_id, result={"ok": True})
         self.assertEqual(succeeded.result, {"ok": True})

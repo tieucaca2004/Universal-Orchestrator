@@ -67,6 +67,22 @@ class AdapterUnavailableError(OrchestratorError):
         )
 
 
+class QualityGateRequiredError(OrchestratorError):
+    """Raised by `TaskManager.succeed()` (Milestone 6.4) when no
+    recorded task-level Quality Gate verdict of PASS exists for this
+    task — a completed process is never, by itself, evidence that the
+    task's acceptance criteria were met."""
+
+    def __init__(self, task_id: str, verdict: str) -> None:
+        self.task_id = task_id
+        self.verdict = verdict
+        super().__init__(
+            f"Task '{task_id}' cannot be marked SUCCEEDED without a recorded "
+            f"Quality Gate PASS tied to its own acceptance criteria; latest "
+            f"task-level verdict is '{verdict}'."
+        )
+
+
 class InvalidStateTransitionError(OrchestratorError):
     def __init__(self, entity: str, current: str, target: str) -> None:
         self.entity = entity
