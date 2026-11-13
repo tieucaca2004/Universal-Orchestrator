@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,11 @@ from universal_orchestrator.execution.adapter import (
     ExecutionOutcome,
     ExecutionResult,
     VerificationStatus,
+)
+from universal_orchestrator.execution.approval import (
+    ApprovalDecision,
+    ApprovalDecisionType,
+    IntegrationProposal,
 )
 from universal_orchestrator.execution.conflict import ConflictReport
 from universal_orchestrator.execution.worktree import WorktreeHandle, WorktreeStatus
@@ -140,6 +146,40 @@ CREATE TABLE IF NOT EXISTS integration_lock (
     holder_task_id TEXT,
     acquired_at TEXT
 );
+
+-- Milestone 6.3: what was actually presented for a decision — never
+-- regenerated from memory after the fact, so the decision recorded
+-- against it always refers to the exact same diff_identity/base_sha.
+CREATE TABLE IF NOT EXISTS integration_proposals (
+    proposal_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    worktree_path TEXT NOT NULL,
+    diff_identity TEXT NOT NULL,
+    target_base_sha TEXT NOT NULL,
+    diff_summary TEXT NOT NULL DEFAULT '',
+    quality_verdict TEXT NOT NULL,
+    conflict_report_id TEXT NOT NULL,
+    conflict_blocks INTEGER NOT NULL,
+    proposed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_integration_proposals_task_id ON integration_proposals(task_id);
+
+-- Milestone 6.3: a human decision, bound to (task_id, action,
+-- diff_identity) — never inferred from silence, timeout, or a
+-- decision recorded for a different action or a different diff.
+CREATE TABLE IF NOT EXISTS approval_decisions (
+    decision_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    diff_identity TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    decided_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_approval_decisions_task_id ON approval_decisions(task_id);
 """
 
 _COLUMNS = (
@@ -168,13 +208,22 @@ class StateManager:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         # check_same_thread=False (Milestone 6.2): the integration lock
         # must be provably atomic under real concurrent callers, not just
-        # sequential calls — SQLite's own single-writer locking is what
-        # actually serializes the UPDATE in `acquire_integration_lock`,
-        # this connection just needs to be usable from more than one
-        # thread to let a real concurrency test exercise that.
+        # sequential calls, so this connection needs to be usable from
+        # more than one thread. The actual serialization guarantee is
+        # `_integration_lock_mutex` below, not this flag by itself — see
+        # its own comment for why.
         self._conn = sqlite3.connect(
             str(self.db_path), isolation_level=None, check_same_thread=False
         )
+        # `check_same_thread=False` only lifts Python's own thread-affinity
+        # check — it does not make concurrent `execute()` calls from two
+        # threads on one connection safe by itself (discovered by a real,
+        # repeatable flaky failure in a genuine multi-thread test of the
+        # integration lock below, not assumed from documentation). This
+        # lock is the actual serialization guarantee for the one method
+        # pair that is deliberately exercised under real concurrency:
+        # `acquire_integration_lock`/`release_integration_lock`.
+        self._integration_lock_mutex = threading.Lock()
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._initialize()
@@ -443,35 +492,111 @@ class StateManager:
 
     def acquire_integration_lock(self, holder_task_id: str) -> bool:
         """Atomic: only succeeds if the lock is currently free
-        (`holder_task_id IS NULL`). SQLite's own single-writer locking
-        on this connection is what makes the UPDATE itself atomic even
-        under real concurrent callers — never a check-then-write race
-        at the Python level."""
-        with self._conn:
-            cursor = self._conn.execute(
-                "UPDATE integration_lock SET holder_task_id = ?, acquired_at = ? "
-                "WHERE id = 1 AND holder_task_id IS NULL",
-                (holder_task_id, datetime.now(timezone.utc).isoformat()),
-            )
-        return cursor.rowcount == 1
+        (`holder_task_id IS NULL`). The UPDATE's own WHERE clause makes
+        the *decision* atomic at the SQL level, but a real multi-thread
+        test of this method against one shared connection (discovered
+        empirically, not assumed) showed that `check_same_thread=False`
+        alone does not make two threads' `execute()` calls on one
+        `sqlite3.Connection` safe to interleave — this method's own
+        `_integration_lock_mutex` is what actually serializes callers at
+        the Python level; without it, a second thread's call could
+        raise instead of cleanly returning `False`."""
+        with self._integration_lock_mutex:
+            with self._conn:
+                cursor = self._conn.execute(
+                    "UPDATE integration_lock SET holder_task_id = ?, acquired_at = ? "
+                    "WHERE id = 1 AND holder_task_id IS NULL",
+                    (holder_task_id, datetime.now(timezone.utc).isoformat()),
+                )
+            return cursor.rowcount == 1
 
     def release_integration_lock(self, holder_task_id: str) -> bool:
         """Only the actual holder may release — never a bare `release()`
         that could free a lock someone else is legitimately holding."""
-        with self._conn:
-            cursor = self._conn.execute(
-                "UPDATE integration_lock SET holder_task_id = NULL, acquired_at = NULL "
-                "WHERE id = 1 AND holder_task_id = ?",
-                (holder_task_id,),
-            )
-        return cursor.rowcount == 1
+        with self._integration_lock_mutex:
+            with self._conn:
+                cursor = self._conn.execute(
+                    "UPDATE integration_lock SET holder_task_id = NULL, acquired_at = NULL "
+                    "WHERE id = 1 AND holder_task_id = ?",
+                    (holder_task_id,),
+                )
+            return cursor.rowcount == 1
 
     def current_integration_lock_holder(self) -> str | None:
+        with self._integration_lock_mutex:
+            cursor = self._conn.execute(
+                "SELECT holder_task_id FROM integration_lock WHERE id = 1"
+            )
+            row = cursor.fetchone()
+            return row["holder_task_id"] if row is not None else None
+
+    # -- integration proposals (Milestone 6.3) ---------------------------------
+
+    def save_integration_proposal(self, proposal: IntegrationProposal) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO integration_proposals (
+                    proposal_id, task_id, project_id, action, worktree_path,
+                    diff_identity, target_base_sha, diff_summary,
+                    quality_verdict, conflict_report_id, conflict_blocks,
+                    proposed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proposal.proposal_id,
+                    proposal.task_id,
+                    proposal.project_id,
+                    proposal.action,
+                    proposal.worktree_path,
+                    proposal.diff_identity,
+                    proposal.target_base_sha,
+                    proposal.diff_summary,
+                    proposal.quality_verdict,
+                    proposal.conflict_report_id,
+                    int(proposal.conflict_blocks),
+                    proposal.proposed_at.isoformat(),
+                ),
+            )
+
+    def latest_integration_proposal(self, task_id: str) -> IntegrationProposal | None:
         cursor = self._conn.execute(
-            "SELECT holder_task_id FROM integration_lock WHERE id = 1"
+            "SELECT * FROM integration_proposals WHERE task_id = ? "
+            "ORDER BY proposed_at DESC LIMIT 1",
+            (task_id,),
         )
         row = cursor.fetchone()
-        return row["holder_task_id"] if row is not None else None
+        return _row_to_integration_proposal(row) if row is not None else None
+
+    # -- approval decisions (Milestone 6.3) ------------------------------------
+
+    def save_approval_decision(self, decision: ApprovalDecision) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO approval_decisions (
+                    decision_id, task_id, project_id, action, diff_identity,
+                    decision, reason, decided_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision.decision_id,
+                    decision.task_id,
+                    decision.project_id,
+                    decision.action,
+                    decision.diff_identity,
+                    decision.decision.value,
+                    decision.reason,
+                    decision.decided_at.isoformat(),
+                ),
+            )
+
+    def get_approval_decisions(self, task_id: str) -> list[ApprovalDecision]:
+        cursor = self._conn.execute(
+            "SELECT * FROM approval_decisions WHERE task_id = ? ORDER BY decided_at",
+            (task_id,),
+        )
+        return [_row_to_approval_decision(row) for row in cursor.fetchall()]
 
 
 def _task_to_row(task: Task) -> dict[str, object]:
@@ -586,4 +711,34 @@ def _row_to_conflict_report(row: sqlite3.Row) -> ConflictReport:
         tier2_conflicting=bool(row["tier2_conflicting"]),
         tier2_conflicting_files=json.loads(row["tier2_conflicting_files"]),
         checked_at=datetime.fromisoformat(row["checked_at"]),
+    )
+
+
+def _row_to_integration_proposal(row: sqlite3.Row) -> IntegrationProposal:
+    return IntegrationProposal(
+        proposal_id=row["proposal_id"],
+        task_id=row["task_id"],
+        project_id=row["project_id"],
+        action=row["action"],
+        worktree_path=row["worktree_path"],
+        diff_identity=row["diff_identity"],
+        target_base_sha=row["target_base_sha"],
+        diff_summary=row["diff_summary"],
+        quality_verdict=row["quality_verdict"],
+        conflict_report_id=row["conflict_report_id"],
+        conflict_blocks=bool(row["conflict_blocks"]),
+        proposed_at=datetime.fromisoformat(row["proposed_at"]),
+    )
+
+
+def _row_to_approval_decision(row: sqlite3.Row) -> ApprovalDecision:
+    return ApprovalDecision(
+        decision_id=row["decision_id"],
+        task_id=row["task_id"],
+        project_id=row["project_id"],
+        action=row["action"],
+        diff_identity=row["diff_identity"],
+        decision=ApprovalDecisionType(row["decision"]),
+        reason=row["reason"],
+        decided_at=datetime.fromisoformat(row["decided_at"]),
     )
