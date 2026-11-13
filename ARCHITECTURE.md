@@ -32,11 +32,13 @@ repository.
 
 | # | Component | Module | Status |
 |---|---|---|---|
-| 1 | Orchestration Engine | `core/engine.py` | Milestone 2 |
+| 1 | Orchestration Engine | `core/engine.py` | **Done** (Milestone 2 scope: Analyzer → Manager → State only — no Agent Router, Dispatcher, or adapter wiring) |
+| 1a | Task Analyzer | `analysis/analyzer.py` | **Done** |
+| 1b | Task Manager | `core/task_manager.py`, `core/lifecycle.py` | **Done** |
 | 2 | Project Profile Registry | `registry/projects.py` | Milestone 3 |
 | 3 | Agent Registry | `registry/agents.py` | Milestone 3 |
 | 4 | Provider Registry | `registry/providers.py` | Milestone 3 |
-| 5 | Task Lifecycle + persistent state | `core/models.py` (data model, done), `core/state.py` (store, Milestone 2) |
+| 5 | Task Lifecycle + persistent state | `core/models.py`, `core/lifecycle.py`, `core/state.py` (SQLite) | **Done** — see [docs/TASK_LIFECYCLE.md](docs/TASK_LIFECYCLE.md) |
 | 6 | Task Planner interface | `planning/planner.py` | **Done** (interface) |
 | 7 | Dispatcher interface | `planning/dispatcher.py` | **Done** (interface) |
 | 8 | Execution Adapter interface | `execution/adapter.py` | **Done** (interface); concrete adapters in Milestone 5 |
@@ -48,7 +50,12 @@ repository.
 Components marked "Done" are real, tested code. Everything else is either a
 genuine interface (6, 7, 8 — explicitly scoped as interfaces) or an empty,
 clearly-labelled placeholder module naming the milestone that implements
-it. Nothing claims to work before it does.
+it (2, 3, 4, and the Approval Gate). Nothing claims to work before it does.
+
+The Task Manager explicitly does **not** decide which agent or provider
+executes a task — that is the Agent Router's job (Milestone 3+). It only
+asks "is this transition allowed" and "is this task's dependency graph
+satisfied".
 
 ## Provider verification policy
 
@@ -69,9 +76,40 @@ Milestone 4 lands, no adapter may perform such actions at all.
 
 ## Roadmap
 
-1. Architecture and repository foundation — **this milestone**.
-2. Core orchestration engine + persistent task lifecycle (SQLite).
+1. Architecture and repository foundation — **done**.
+2. Task Analyzer, Task Manager, State Manager (SQLite) — **done**.
 3. Project and agent registries.
 4. Approval gate and audit trail.
 5. Execution adapter interfaces → first concrete adapter(s).
 6. Tests, documentation and integration verification.
+
+## Open architectural questions for Founder review
+
+Recorded rather than silently resolved — see the Milestone 2 repository
+audit for how each was found.
+
+1. **Machine identity is still unresolved.** Milestone 2's brief describes
+   an approved architecture with the NUC Ubuntu Server as the control
+   plane and the RTX 3070 Desktop as a Worker Runtime. Phase 0 discovery
+   found: the machine actually running this repository (`tieu`) is an
+   ASUS laptop, not the Intel NUC; the NUC (last seen at a now-obsolete
+   IP) was unreachable when checked; and the RTX 3070 Desktop was
+   confirmed powered off, with "no hard dependency on it" as an explicit
+   Phase 1 approval boundary. Nothing in this milestone's code assumes a
+   specific machine — the Task Analyzer, Task Manager and State Manager
+   are plain Python + SQLite and run anywhere — but the two-machine
+   Planner/Architect/Reviewer-on-NUC vs. Coder/Tester/Executor-on-RTX3070
+   split is a real architectural commitment that hasn't been verified
+   against the actual hardware yet. Needs a Founder decision before any
+   milestone that implements Worker Protocol or cross-machine execution.
+2. **None of the 11 named governance documents exist yet**
+   (`FOUNDER_CONSTITUTION.md`, `MASTER_ARCHITECTURE.md`,
+   `ORCHESTRATION_ENGINE.md`, `AGENT_WORKFLOW.md`, `PROJECT_PROFILES.md`,
+   `SECURITY_AND_APPROVAL.md`, `GIT_GOVERNANCE.md`,
+   `MEMORY_AND_PERSISTENCE.md`, `WORKER_PROTOCOL.md`, `ROADMAP.md`,
+   `DEFINITION_OF_DONE.md`). This repository does not fabricate their
+   contents. The Task Analyzer takes a `Constitution` as an explicit,
+   caller-supplied object instead of reading `FOUNDER_CONSTITUTION.md`,
+   and a `ProjectProfile` instead of reading `PROJECT_PROFILES.md` —
+   if/when those files are written, a loader can be added without
+   changing the Analyzer's interface.

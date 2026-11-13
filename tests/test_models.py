@@ -36,17 +36,19 @@ class ProviderDescriptorTests(unittest.TestCase):
 class TaskTests(unittest.TestCase):
     def test_records_initial_history_entry(self):
         task = Task(title="scaffold core", project_id="proj_abc123")
-        self.assertIs(task.status, TaskStatus.PENDING)
+        self.assertIs(task.status, TaskStatus.CREATED)
         self.assertEqual(len(task.history), 1)
         status, _timestamp = task.history[0]
-        self.assertEqual(status, TaskStatus.PENDING.value)
+        self.assertEqual(status, TaskStatus.CREATED.value)
 
     def test_terminal_statuses_exclude_active_ones(self):
         self.assertIn(TaskStatus.SUCCEEDED, TERMINAL_TASK_STATUSES)
         self.assertIn(TaskStatus.FAILED, TERMINAL_TASK_STATUSES)
         self.assertIn(TaskStatus.CANCELLED, TERMINAL_TASK_STATUSES)
-        self.assertNotIn(TaskStatus.PENDING, TERMINAL_TASK_STATUSES)
+        self.assertNotIn(TaskStatus.CREATED, TERMINAL_TASK_STATUSES)
         self.assertNotIn(TaskStatus.RUNNING, TERMINAL_TASK_STATUSES)
+        self.assertNotIn(TaskStatus.BLOCKED, TERMINAL_TASK_STATUSES)
+        self.assertNotIn(TaskStatus.INTERRUPTED, TERMINAL_TASK_STATUSES)
 
 
 if __name__ == "__main__":

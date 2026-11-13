@@ -1,7 +1,8 @@
-"""Milestone 1 only has to prove two things about the not-yet-implemented
-components: the explicit interfaces (planner, dispatcher, execution
-adapter) really are abstract, and every placeholder module at least
-imports cleanly so the package tree is sound.
+"""Two things about the components that still aren't implemented: the
+explicit interfaces (planner, dispatcher, execution adapter) really are
+abstract, and every remaining placeholder module at least imports
+cleanly. `core.engine` and `core.state` graduated out of this list in
+Milestone 2 — they have their own test modules now.
 """
 
 import importlib
@@ -12,8 +13,6 @@ from universal_orchestrator.planning.dispatcher import Dispatcher
 from universal_orchestrator.planning.planner import TaskPlanner
 
 PLACEHOLDER_MODULES = (
-    "universal_orchestrator.core.engine",
-    "universal_orchestrator.core.state",
     "universal_orchestrator.registry.projects",
     "universal_orchestrator.registry.agents",
     "universal_orchestrator.registry.providers",

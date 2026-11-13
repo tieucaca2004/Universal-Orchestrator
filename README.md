@@ -10,14 +10,16 @@ by absorbing or copying them.
 
 ## Status
 
-Milestone 1 — architecture and repository foundation. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for the component map and roadmap.
+Milestone 2 — Task Analyzer, Task Manager and State Manager. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the component map, roadmap and open
+architectural questions, and [docs/TASK_LIFECYCLE.md](docs/TASK_LIFECYCLE.md)
+for the task state machine.
 
 ## Stack
 
 - Python 3.11+, standard library first.
-- SQLite for persistent task state (Milestone 2) — no external database.
-- pytest for tests.
+- SQLite (stdlib `sqlite3`) for persistent task state — no external database.
+- Standard library `unittest` for tests (see "Running tests" below).
 - No web framework, no container runtime, and no hard dependency on any
   single AI provider. The current execution host is a resource-constrained
   machine (4 threads, ~7 GB RAM), so the Core is deliberately lightweight.
@@ -26,12 +28,14 @@ Milestone 1 — architecture and repository foundation. See
 
 ```
 src/universal_orchestrator/
-  core/        data models, orchestration engine, persistent task state
-  registry/    project, agent and provider registries
+  analysis/    Task Analyzer — TaskRequest -> TaskSpecification
+  core/        data models, task lifecycle rules, Task Manager,
+               State Manager (SQLite), orchestration engine
+  registry/    project, agent and provider registries (Milestone 3)
   planning/    task planner and dispatcher interfaces
   execution/   execution adapter interface (Claude Code, Gemini CLI,
                DeepSeek, Kimi, OpenClaw, Hermes, future RTX 3070 worker)
-  approval/    approval gate for sensitive operations
+  approval/    approval gate for sensitive operations (Milestone 4)
   audit/       structured logging (full audit trail in Milestone 4)
   config/      configuration management
   errors.py    shared exception hierarchy
