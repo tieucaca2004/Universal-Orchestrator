@@ -79,6 +79,7 @@ class BlockingAdapter(ExecutionAdapter):
         self.max_active = 0
         self.calls: list[str] = []
         self.input_contexts: dict[str, str] = {}
+        self.timeout_seconds: dict[str, float] = {}
 
     def verify(self) -> VerificationStatus:
         return VerificationStatus.AVAILABLE
@@ -89,6 +90,7 @@ class BlockingAdapter(ExecutionAdapter):
             self.max_active = max(self.max_active, self.active)
             self.calls.append(request.task_id)
             self.input_contexts[request.task_id] = request.input_context
+            self.timeout_seconds[request.task_id] = request.timeout_seconds
         self.started.set()
         self.release.wait(timeout=10)
         Path(request.working_directory, "agent_output.txt").write_text("fake output\n")
@@ -452,6 +454,143 @@ class InputContextTests(SchedulerTestCase):
         received = self.adapter.input_contexts[task.task_id]
         self.assertNotEqual(received, "")
         self.assertIn("Do the real work", received)
+        scheduler.shutdown()
+
+
+class DispatchTimeoutConfigurationTests(SchedulerTestCase):
+    """Audit Finding C-4 regression tests: the dispatch timeout used
+    to be GovernedPipeline.dispatch()'s own hardcoded 60s default,
+    with no way for a deployment to configure it."""
+
+    def test_default_dispatch_timeout_is_unchanged(self):
+        task_id = self._submit()
+        self.adapter.release.set()
+        scheduler = Scheduler(self.state, self.engine, self.pipeline, self.projects, settings=self.settings)
+        scheduler.start()
+        scheduler.run_once()
+        self.assertTrue(_wait_until(lambda: task_id in self.adapter.timeout_seconds))
+        self.assertEqual(self.adapter.timeout_seconds[task_id], 60.0)
+        scheduler.shutdown()
+
+    def test_configured_dispatch_timeout_reaches_the_adapter(self):
+        task_id = self._submit()
+        self.adapter.release.set()
+        settings = SchedulerSettings(
+            max_concurrency=1, lease_seconds=30, poll_seconds=0.05,
+            drain_timeout_seconds=1.0, dispatch_timeout_seconds=5.0,
+        )
+        scheduler = Scheduler(self.state, self.engine, self.pipeline, self.projects, settings=settings)
+        scheduler.start()
+        scheduler.run_once()
+        self.assertTrue(_wait_until(lambda: task_id in self.adapter.timeout_seconds))
+        self.assertEqual(self.adapter.timeout_seconds[task_id], 5.0)
+        scheduler.shutdown()
+
+
+class LiveStallDetectionTests(SchedulerTestCase):
+    """Audit Finding C-5 regression test: the Stall Detector used to
+    be reachable only via a separate, manually/cron-invoked
+    `alerts_cli scan` -- a live Scheduler's own loop never ran it."""
+
+    def test_run_once_raises_a_real_alert_for_a_deadlocked_task_with_no_manual_scan(self):
+        a = self.engine.manager.create_task("a", self.project.project_id)
+        b = self.engine.manager.create_task("b", self.project.project_id)
+        # Hand-construct a cycle directly in storage -- add_dependency()
+        # itself refuses to create one, by design.
+        from universal_orchestrator.core.models import TaskStatus
+        a_obj = self.engine.manager.get(a.task_id)
+        a_obj.depends_on = (b.task_id,)
+        a_obj.status = TaskStatus.BLOCKED
+        self.state.update(a_obj)
+        b_obj = self.engine.manager.get(b.task_id)
+        b_obj.depends_on = (a.task_id,)
+        b_obj.status = TaskStatus.BLOCKED
+        self.state.update(b_obj)
+        self.engine.manager.sync_new_tasks()
+
+        scheduler = Scheduler(self.state, self.engine, self.pipeline, self.projects, settings=self.settings)
+        scheduler.start()
+        scheduler.run_once()  # no explicit alerts_cli invocation anywhere in this test
+
+        alerts = self.state.list_alerts(acknowledged=False)
+        kinds = {alert.task_id: alert.kind.value for alert in alerts}
+        self.assertEqual(kinds.get(a.task_id), "deadlocked")
+        scheduler.shutdown()
+
+    def test_run_once_does_not_duplicate_an_already_open_alert(self):
+        a = self.engine.manager.create_task("a", self.project.project_id)
+        b = self.engine.manager.create_task("b", self.project.project_id)
+        from universal_orchestrator.core.models import TaskStatus
+        a_obj = self.engine.manager.get(a.task_id)
+        a_obj.depends_on = (b.task_id,)
+        a_obj.status = TaskStatus.BLOCKED
+        self.state.update(a_obj)
+        b_obj = self.engine.manager.get(b.task_id)
+        b_obj.depends_on = (a.task_id,)
+        b_obj.status = TaskStatus.BLOCKED
+        self.state.update(b_obj)
+        self.engine.manager.sync_new_tasks()
+
+        scheduler = Scheduler(self.state, self.engine, self.pipeline, self.projects, settings=self.settings)
+        scheduler.start()
+        scheduler.run_once()
+        scheduler.run_once()
+        scheduler.run_once()
+
+        alerts = [a for a in self.state.list_alerts(acknowledged=False) if a.task_id == a_obj.task_id]
+        self.assertEqual(len(alerts), 1)
+        scheduler.shutdown()
+
+
+class WorktreeCrashRecoveryWiringTests(SchedulerTestCase):
+    """Audit Finding C-12 regression test: `WorktreeManager.recover()`
+    existed but was never called from any real startup path."""
+
+    def test_scheduler_start_reconciles_a_worktree_whose_directory_vanished(self):
+        task_id = self._submit()
+        self.adapter.release.set()
+        scheduler = Scheduler(self.state, self.engine, self.pipeline, self.projects, settings=self.settings)
+        scheduler.start()
+        scheduler.run_once()
+        leases = SchedulerLeaseManager(self.state)
+        self.assertTrue(_wait_until(
+            lambda: leases.get_claim(task_id) and leases.get_claim(task_id).status == ClaimStatus.COMPLETED
+        ))
+        scheduler.shutdown()  # releases the lease -- a fresh start() below can reacquire it immediately
+
+        # Simulate the Worktree directory having been lost (e.g. this
+        # Orchestrator crashed between `git worktree add` and
+        # persisting the row) by forcing a non-terminal status that
+        # no longer matches reality on disk.
+        handle = self.pipeline.worktrees.get(task_id)
+        handle.status = WorktreeStatus.EXECUTING
+        self.state.update_worktree(handle)
+        import shutil
+        shutil.rmtree(handle.path, ignore_errors=True)
+
+        scheduler2 = Scheduler(self.state, self.engine, self.pipeline, self.projects, settings=self.settings)
+        scheduler2.start()  # no explicit WorktreeManager.recover() call anywhere in this test
+
+        self.assertEqual(self.pipeline.worktrees.get(task_id).status, WorktreeStatus.NEEDS_REVIEW)
+        scheduler2.shutdown()
+
+    def test_recover_worktrees_runs_once_per_registered_project_at_start(self):
+        task_id = self._submit()
+        self.adapter.release.set()
+        handle = self.pipeline.worktrees.get
+        scheduler = Scheduler(self.state, self.engine, self.pipeline, self.projects, settings=self.settings)
+
+        calls = []
+        original = self.pipeline.worktrees.recover
+
+        def spy_recover(repository_path):
+            calls.append(repository_path)
+            return original(repository_path)
+
+        self.pipeline.worktrees.recover = spy_recover
+        scheduler.start()
+
+        self.assertEqual(calls, [str(self.repo_path)])
         scheduler.shutdown()
 
 

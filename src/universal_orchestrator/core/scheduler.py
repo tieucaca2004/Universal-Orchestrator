@@ -57,6 +57,7 @@ from universal_orchestrator.config.scheduler_settings import (
 from universal_orchestrator.core.engine import OrchestrationEngine
 from universal_orchestrator.core.governed_pipeline import GovernedPipeline
 from universal_orchestrator.core.models import RoutingOutcome, TaskStatus
+from universal_orchestrator.core.stall_detector import StallDetector
 from universal_orchestrator.errors import DuplicateError, InvalidStateTransitionError, NotFoundError
 from universal_orchestrator.execution.scheduler import ClaimStatus
 from universal_orchestrator.execution.hermes_transfer import HermesWorkspaceTransfer
@@ -125,6 +126,15 @@ class Scheduler:
         self._workspace_transfer = workspace_transfer
         self._input_context_builder = input_context_builder
         self._leases = SchedulerLeaseManager(state)
+        # Audit Finding C-5: previously only reachable out-of-band via
+        # `alerts_cli scan` -- a live Scheduler never ran it itself.
+        # `StallDetector.scan()` only ever reads Task/Worktree state
+        # and writes its own `scheduler_alerts` bookkeeping (never a
+        # Task/Worktree mutation), and already dedupes against each
+        # task's currently-open alert of the same kind, so calling it
+        # once per `run_once()` is safe and never produces duplicate
+        # alerts for a persisting condition.
+        self._stall_detector = StallDetector(state, engine.manager, pipeline.worktrees, self._settings)
         self._epoch: int | None = None
         self._stop_event = Event()
         self._executor: ThreadPoolExecutor | None = None
@@ -150,6 +160,29 @@ class Scheduler:
         self._executor = ThreadPoolExecutor(max_workers=max(1, self._settings.max_concurrency))
         self._recover()
         self._reconcile_task_state()
+        self._recover_worktrees()
+
+    def _recover_worktrees(self) -> None:
+        """Audit Finding C-12: `WorktreeManager.recover()` existed but
+        was never called from any real startup path -- a Worktree
+        whose persisted state disagreed with the real Git worktree on
+        disk (e.g. this Orchestrator crashed between `git worktree
+        add` and persisting the row) stayed unreconciled until a human
+        happened to invoke it by hand. Runs once per registered
+        project, here and only here -- the authoritative moment a new
+        Scheduler takes over, after stale claims are already
+        quarantined, never on every CLI bootstrap (that would race
+        exactly like `TaskManager.recover()` did before the C-1 fix).
+        Only ever reclassifies an uncertain Worktree to NEEDS_REVIEW
+        for a later human decision -- never deletes anything."""
+        for profile in self._projects.list():
+            try:
+                self._pipeline.worktrees.recover(profile.repository_path)
+            except Exception:
+                _LOG.exception(
+                    "worktree recovery failed for a project -- continuing with the others",
+                    extra={"fields": {"project_id": profile.project_id}},
+                )
 
     def _acquire_with_retry(self) -> int:
         while not self._stop_event.is_set():
@@ -226,6 +259,7 @@ class Scheduler:
         the caller must stop scheduling immediately, not retry."""
         self._leases.renew(self._holder_id, self._epoch, lease_seconds=self._settings.lease_seconds)
         self._engine.manager.sync_new_tasks()
+        self._stall_detector.scan()
 
         dispatched: list[str] = []
         for task in self._ready_tasks():
@@ -335,6 +369,7 @@ class Scheduler:
             self._pipeline.dispatch(
                 task_id, project,
                 input_context=input_context, workspace_transfer=self._workspace_transfer,
+                timeout_seconds=self._settings.dispatch_timeout_seconds,
             )
         except Exception:
             _LOG.exception("dispatch failed", extra={"fields": {"task_id": task_id}})

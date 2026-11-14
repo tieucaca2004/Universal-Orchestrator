@@ -18,6 +18,7 @@ LEASE_SECONDS_ENV = "UO_SCHEDULER_LEASE_SECONDS"
 HEARTBEAT_SECONDS_ENV = "UO_SCHEDULER_HEARTBEAT_SECONDS"
 POLL_SECONDS_ENV = "UO_SCHEDULER_POLL_SECONDS"
 DRAIN_TIMEOUT_SECONDS_ENV = "UO_SCHEDULER_DRAIN_TIMEOUT_SECONDS"
+DISPATCH_TIMEOUT_SECONDS_ENV = "UO_SCHEDULER_DISPATCH_TIMEOUT_SECONDS"
 RUNNING_STALL_THRESHOLD_ENV = "UO_STALL_RUNNING_THRESHOLD_SECONDS"
 BLOCKED_STALL_THRESHOLD_ENV = "UO_STALL_BLOCKED_THRESHOLD_SECONDS"
 QUALITY_CHECK_STALL_THRESHOLD_ENV = "UO_STALL_QUALITY_CHECK_THRESHOLD_SECONDS"
@@ -42,6 +43,14 @@ class SchedulerSettings:
     heartbeat_seconds: float = 10.0
     poll_seconds: float = 2.0
     drain_timeout_seconds: float = 120.0
+    # Audit Finding C-4: distinct from drain_timeout_seconds (how long
+    # *shutdown* waits for workers already running) -- this is how
+    # long a single dispatched Agent execution itself is allowed to
+    # run before GovernedPipeline.dispatch()/the adapter forcibly
+    # terminates it. Default matches the prior hardcoded value
+    # exactly, so existing deployments see no behavior change unless
+    # they opt into a longer one.
+    dispatch_timeout_seconds: float = 60.0
     running_stall_threshold_seconds: float = 1800.0
     blocked_stall_threshold_seconds: float = 3600.0
     quality_check_stall_threshold_seconds: float = 900.0
@@ -54,6 +63,7 @@ def load_scheduler_settings() -> SchedulerSettings:
         heartbeat_seconds=_float_env(HEARTBEAT_SECONDS_ENV, 10.0),
         poll_seconds=_float_env(POLL_SECONDS_ENV, 2.0),
         drain_timeout_seconds=_float_env(DRAIN_TIMEOUT_SECONDS_ENV, 120.0),
+        dispatch_timeout_seconds=_float_env(DISPATCH_TIMEOUT_SECONDS_ENV, 60.0),
         running_stall_threshold_seconds=_float_env(RUNNING_STALL_THRESHOLD_ENV, 1800.0),
         blocked_stall_threshold_seconds=_float_env(BLOCKED_STALL_THRESHOLD_ENV, 3600.0),
         quality_check_stall_threshold_seconds=_float_env(

@@ -101,6 +101,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             settings.max_concurrency = args.max_concurrency
         if args.drain_timeout is not None:
             settings.drain_timeout_seconds = args.drain_timeout
+        if args.dispatch_timeout is not None:
+            settings.dispatch_timeout_seconds = args.dispatch_timeout
 
         workspace_transfer = None
         if args.adapter == "hermes":
@@ -140,6 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--adapter-target", default="")
     run.add_argument("--max-concurrency", type=int, default=None, help="Overrides UO_SCHEDULER_MAX_CONCURRENCY.")
     run.add_argument("--drain-timeout", type=float, default=None, help="Seconds; overrides UO_SCHEDULER_DRAIN_TIMEOUT_SECONDS.")
+    run.add_argument("--dispatch-timeout", type=float, default=None, help="Seconds; overrides UO_SCHEDULER_DISPATCH_TIMEOUT_SECONDS.")
     run.set_defaults(func=cmd_run)
 
     return parser
