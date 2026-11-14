@@ -1,4 +1,6 @@
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -29,6 +31,8 @@ from universal_orchestrator.execution.adapter import (
     VerificationStatus,
 )
 from universal_orchestrator.execution.registry import AdapterRegistry
+from universal_orchestrator.execution.scheduler import ClaimStatus
+from universal_orchestrator.execution.scheduler_manager import SchedulerLeaseManager
 from universal_orchestrator.registry.agents import AgentRegistry
 from universal_orchestrator.registry.projects import ProjectRegistry
 from universal_orchestrator.registry.providers import ProviderRegistry
@@ -129,6 +133,88 @@ class RecoveryOnBootstrapTests(EngineTestCase):
         second_engine = OrchestrationEngine.bootstrap(self.state)
 
         self.assertIs(second_engine.manager.get(task.task_id).status, TaskStatus.INTERRUPTED)
+
+
+class BootstrapClaimFencingTests(EngineTestCase):
+    """Audit Finding C-1 regression tests. Before the fix,
+    `OrchestrationEngine.bootstrap()` called `TaskManager.recover()`
+    unconditionally — any concurrent, unrelated CLI invocation (e.g.
+    `propose`, `integrate`, `alerts_cli list`) would force a RUNNING
+    task a live Milestone-7 Scheduler was actively executing back to
+    INTERRUPTED, racing with that Scheduler's own eventual
+    `succeed()`/`fail()` write and corrupting task history. These
+    tests would fail against the pre-fix `bootstrap()`."""
+
+    def _new_state_connection(self) -> StateManager:
+        return StateManager(Path(self._tmpdir.name) / "orchestrator.sqlite3")
+
+    def test_bootstrap_does_not_interrupt_a_task_with_a_live_scheduler_claim(self):
+        first_engine = OrchestrationEngine.bootstrap(self.state)
+        task = first_engine.submit(self._request(), self.profile)
+        first_engine.manager.start(task.task_id)
+
+        leases = SchedulerLeaseManager(self.state)
+        epoch = leases.acquire("holder-A", lease_seconds=30)
+        self.assertTrue(leases.claim_task(task.task_id, "holder-A", epoch))
+
+        # Simulates an unrelated, concurrent CLI invocation (propose,
+        # integrate, alerts_cli, a second submit...) bootstrapping its
+        # own engine while holder-A's Scheduler is still genuinely,
+        # live, mid-execution on this exact task.
+        second_engine = OrchestrationEngine.bootstrap(self.state)
+
+        self.assertIs(second_engine.manager.get(task.task_id).status, TaskStatus.RUNNING)
+
+        # The live holder can still legitimately complete the task
+        # afterwards -- the race did not corrupt anything.
+        self.assertTrue(leases.complete_claim(task.task_id, "holder-A", epoch))
+
+    def test_bootstrap_still_interrupts_once_the_claim_is_quarantined_by_a_takeover(self):
+        first_engine = OrchestrationEngine.bootstrap(self.state)
+        task = first_engine.submit(self._request(), self.profile)
+        first_engine.manager.start(task.task_id)
+
+        leases = SchedulerLeaseManager(self.state)
+        stale_epoch = leases.acquire("holder-A", lease_seconds=0.05)
+        self.assertTrue(leases.claim_task(task.task_id, "holder-A", stale_epoch))
+
+        time.sleep(0.15)  # holder-A's lease has now expired
+
+        new_epoch = leases.acquire("holder-B", lease_seconds=30)
+        self.assertTrue(leases.quarantine_claim(task.task_id, "holder-B", new_epoch))
+        self.assertEqual(leases.get_claim(task.task_id).status, ClaimStatus.QUARANTINED)
+
+        # Only now -- after the stale claim has been quarantined by a
+        # new authority, exactly as `Scheduler._recover()` does on a
+        # real takeover -- is it safe for a fresh bootstrap to flag
+        # the orphaned task INTERRUPTED.
+        third_engine = OrchestrationEngine.bootstrap(self.state)
+        self.assertIs(third_engine.manager.get(task.task_id).status, TaskStatus.INTERRUPTED)
+
+    def test_concurrent_bootstrap_calls_never_corrupt_or_crash(self):
+        first_engine = OrchestrationEngine.bootstrap(self.state)
+        task = first_engine.submit(self._request(), self.profile)
+        first_engine.manager.start(task.task_id)  # orphaned: no scheduler claim at all
+
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(4)
+
+        def _bootstrap_once():
+            try:
+                barrier.wait(timeout=5)
+                OrchestrationEngine.bootstrap(self._new_state_connection())
+            except BaseException as exc:  # pragma: no cover - failure path only
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_bootstrap_once) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        final_engine = OrchestrationEngine.bootstrap(self.state)
+        self.assertIs(final_engine.manager.get(task.task_id).status, TaskStatus.INTERRUPTED)
 
 
 class FailurePropagationTests(EngineTestCase):

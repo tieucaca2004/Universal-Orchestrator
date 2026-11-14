@@ -17,6 +17,17 @@ a provider's verification could be revoked, the adapter itself could
 stop being available. `execute()` therefore revalidates all three
 immediately before dispatch rather than trusting the persisted
 decision alone; see the four checks at the top of the method body.
+
+M1-M7 audit remediation (Finding C-1): `bootstrap()`'s interrupted-
+task recovery used to be unconditional, which was safe only as long
+as at most one process ever had a `TaskManager` cache open against
+this `StateManager` at a time. Milestone 7's Scheduler broke that
+assumption — it is a long-running process that can be, and is meant
+to be, running concurrently with any of `orchestrator_cli`/
+`alerts_cli`/`scheduler_cli` being invoked by a human. `bootstrap()`
+now protects any task with a live Milestone-7 scheduler claim from
+being force-interrupted by a *different* process's bootstrap; see
+`actively_claimed_task_ids` and `TaskManager.recover`.
 """
 
 from __future__ import annotations
@@ -49,9 +60,28 @@ from universal_orchestrator.execution.adapter import (
     VerificationStatus,
 )
 from universal_orchestrator.execution.registry import AdapterRegistry
+from universal_orchestrator.execution.scheduler import ClaimStatus
+from universal_orchestrator.execution.scheduler_manager import SchedulerLeaseManager
 from universal_orchestrator.registry.agents import AgentRegistry
 from universal_orchestrator.registry.providers import ProviderRegistry
 from universal_orchestrator.routing.router import AgentRouter
+
+
+def actively_claimed_task_ids(state: StateManager) -> frozenset[str]:
+    """Task ids with a live (status=CLAIMED) Milestone-7 scheduler
+    claim right now — owned by some Scheduler process, possibly this
+    one, possibly another, possibly dead-but-not-yet-superseded.
+    `bootstrap()`'s recovery must never interrupt these: it has no
+    way to tell whether that holder is still actually running them,
+    and guessing wrong in either direction is unsafe. Only a future
+    recovery scan that finds the claim quarantined (a new epoch took
+    over) may ever flag the task INTERRUPTED — see
+    `core.scheduler.Scheduler._reconcile_task_state`, which runs
+    exactly that scan right after quarantining stale claims."""
+    return frozenset(
+        claim.task_id
+        for claim in SchedulerLeaseManager(state).list_claims(status=ClaimStatus.CLAIMED)
+    )
 
 
 @dataclass
@@ -75,9 +105,10 @@ class OrchestrationEngine:
     ) -> "OrchestrationEngine":
         """Build the engine and recover any interrupted tasks from a prior
         run. Interrupted tasks are only flagged, never auto-resolved — see
-        `TaskManager.resolve_interrupted`."""
+        `TaskManager.resolve_interrupted`. Tasks with a live Milestone-7
+        scheduler claim are never touched — see `actively_claimed_task_ids`."""
         manager = TaskManager(state)
-        manager.recover()
+        manager.recover(protect=actively_claimed_task_ids(state))
         return cls(
             analyzer=analyzer or TaskAnalyzer(),
             manager=manager,

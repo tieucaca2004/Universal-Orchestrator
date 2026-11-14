@@ -311,6 +311,52 @@ class CrossProcessTakeoverTests(SchedulerTestCase):
             other_state.close()
         scheduler1.shutdown()
 
+    def test_takeover_reconciliation_marks_the_orphaned_running_task_interrupted(self):
+        """Audit Finding C-1 regression test. `Scheduler._recover()`
+        only ever quarantines the stale `scheduler_claims` row -- it
+        never touched `TaskManager`'s own `tasks` table, so the task
+        itself was left RUNNING forever (never re-claimable, never
+        flagged for a human) after a real takeover. This would fail
+        before `Scheduler._reconcile_task_state()` existed."""
+        from universal_orchestrator.core.models import TaskStatus
+
+        task_id = self._submit()
+
+        short_lease_settings = SchedulerSettings(
+            max_concurrency=1, lease_seconds=0.05, poll_seconds=0.02, drain_timeout_seconds=1.0,
+        )
+        scheduler1 = Scheduler(
+            self.state, self.engine, self.pipeline, self.projects, settings=short_lease_settings,
+        )
+        scheduler1.start()
+        self.assertEqual(scheduler1.run_once(), [task_id])
+        self.assertTrue(self.adapter.started.wait(timeout=2))  # worker blocked mid-execute(): task is RUNNING
+
+        time.sleep(0.15)  # scheduler1's lease has now expired
+
+        other_state = self._new_state_connection()
+        try:
+            other_adapter = BlockingAdapter()
+            other_adapter.release.set()
+            other_engine, other_pipeline = _build_stack(other_state, other_adapter)
+            scheduler2 = Scheduler(
+                other_state, other_engine, other_pipeline, self.projects,
+                settings=SchedulerSettings(max_concurrency=1, lease_seconds=30, poll_seconds=0.02,
+                                            drain_timeout_seconds=1.0),
+            )
+            scheduler2.start()  # quarantines the stale claim, then reconciles task state
+
+            self.assertIs(other_engine.manager.get(task_id).status, TaskStatus.INTERRUPTED)
+            # Never re-dispatched automatically -- a human must call
+            # resolve_interrupted() first (unchanged M1-M6 contract).
+            self.assertEqual(scheduler2.run_once(), [])
+
+            self.adapter.release.set()
+            self.assertTrue(_wait_until(lambda: scheduler1._active_count() == 0))
+        finally:
+            other_state.close()
+        scheduler1.shutdown()
+
 
 class ShutdownDrainTests(SchedulerTestCase):
     def test_shutdown_does_not_release_lease_while_a_worker_is_unconfirmed(self):

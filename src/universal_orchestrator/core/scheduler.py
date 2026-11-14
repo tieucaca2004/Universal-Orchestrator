@@ -149,6 +149,7 @@ class Scheduler:
         self._epoch = self._acquire_with_retry()
         self._executor = ThreadPoolExecutor(max_workers=max(1, self._settings.max_concurrency))
         self._recover()
+        self._reconcile_task_state()
 
     def _acquire_with_retry(self) -> int:
         while not self._stop_event.is_set():
@@ -178,6 +179,27 @@ class Scheduler:
                     "new_holder_id": self._holder_id, "new_epoch": self._epoch,
                 }},
             )
+
+    def _reconcile_task_state(self) -> None:
+        """Audit remediation (Finding C-1): `_recover()` above only
+        ever quarantines stale `scheduler_claims` rows; it never
+        touches `TaskManager`'s `tasks` table. A task left RUNNING by
+        a now-superseded (crashed) holder was, until this call,
+        protected forever from `TaskManager.recover()` by
+        `bootstrap()`'s own fencing (its claim still looked CLAIMED
+        at bootstrap time, before this lease was even acquired).
+        Now that `_recover()` has quarantined every stale claim, this
+        re-runs `TaskManager.recover()` with the now-current (and,
+        right after a fresh takeover, normally empty) set of still-
+        CLAIMED task_ids protected — any task whose claim just got
+        quarantined is no longer in that set, so it is finally, and
+        only now, flagged INTERRUPTED for a human to resolve via
+        `resolve_interrupted`. A task still genuinely claimed under
+        any live epoch (including this one) remains untouched."""
+        protect = frozenset(
+            claim.task_id for claim in self._leases.list_claims(status=ClaimStatus.CLAIMED)
+        )
+        self._engine.manager.recover(protect=protect)
 
     def _quarantine_worktree_if_ambiguous(self, task_id: str) -> None:
         try:

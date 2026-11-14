@@ -300,15 +300,28 @@ class TaskManager:
 
     # -- restart / interruption recovery ------------------------------------
 
-    def recover(self) -> list[str]:
+    def recover(self, *, protect: frozenset[str] = frozenset()) -> list[str]:
         """Reload tasks from the store and flag any left RUNNING as
-        INTERRUPTED. Never resolves them automatically — see
-        `resolve_interrupted`."""
+        INTERRUPTED — except any task_id in `protect`, which is left
+        untouched no matter its status. Never resolves a flagged task
+        automatically either way — see `resolve_interrupted`.
+
+        M7 fencing fix: a RUNNING task used to be interrupted purely
+        because *this* process had never heard of it continuing, with
+        no way to distinguish "genuinely orphaned by a crashed
+        process" from "currently, legitimately, being run by a live
+        Scheduler in a different process." Callers pass the set of
+        task_ids with a live (CLAIMED) Milestone-7 scheduler claim as
+        `protect` for exactly this reason — see
+        `core.engine.actively_claimed_task_ids`. A caller with no
+        notion of scheduler claims at all (every existing M1-M6 call
+        site) passes nothing, which reproduces the original
+        unconditional behavior exactly."""
         self._tasks = {t.task_id: t for t in self._state.list()}
 
         interrupted: list[str] = []
         for task in self._tasks.values():
-            if task.status == TaskStatus.RUNNING:
+            if task.status == TaskStatus.RUNNING and task.task_id not in protect:
                 self._transition(task, TaskStatus.INTERRUPTED)
                 self._persist(task)
                 interrupted.append(task.task_id)
