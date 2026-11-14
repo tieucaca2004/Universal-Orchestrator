@@ -46,6 +46,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from universal_orchestrator.audit.logger import get_logger
 from universal_orchestrator.config.settings import load_settings
 from universal_orchestrator.core.engine import OrchestrationEngine
 from universal_orchestrator.core.governed_pipeline import GovernedPipeline
@@ -262,6 +263,44 @@ def cmd_propose(args: argparse.Namespace) -> int:
         state.close()
 
 
+def cmd_recover_proposal(args: argparse.Namespace) -> int:
+    """Milestone 7, Component D. Never builds an adapter/router --
+    `_build_pipeline_light` is the same "never dispatches an Agent"
+    stack `propose`/`integrate` already use; `recover_proposal` itself
+    never calls `engine.execute()` either (see its own docstring)."""
+    logger = get_logger("recover_proposal")
+    state = _open_state(args.db)
+    try:
+        engine, pipeline = _build_pipeline_light(state)
+        project = ProjectProfile(
+            name=args.project_name, repository_path=args.repo, project_id=args.project_id
+        )
+        try:
+            proposal = pipeline.recover_proposal(args.task_id, project)
+        except Exception as exc:
+            logger.warning(
+                "recover-proposal refused",
+                extra={"fields": {"task_id": args.task_id, "reason": str(exc)}},
+            )
+            print(f"Refused: {exc}")
+            return 1
+
+        logger.info(
+            "recover-proposal succeeded",
+            extra={"fields": {
+                "task_id": args.task_id,
+                "diff_identity": proposal.diff_identity,
+                "conflict_blocks": proposal.conflict_blocks,
+            }},
+        )
+        print(f"RECOVERED_PROPOSAL diff_identity={proposal.diff_identity}")
+        print(f"Conflict blocks: {proposal.conflict_blocks}")
+        print(f"Worktree status: {pipeline.worktrees.get(args.task_id).status.value}")
+        return 0
+    finally:
+        state.close()
+
+
 def cmd_integrate(args: argparse.Namespace) -> int:
     state = _open_state(args.db)
     try:
@@ -319,6 +358,17 @@ def build_parser() -> argparse.ArgumentParser:
     propose.add_argument("--project-name", default="project")
     propose.add_argument("--evidence", action="append", default=[], help="criterion=true|false")
     propose.set_defaults(func=cmd_propose)
+
+    recover = sub.add_parser(
+        "recover-proposal",
+        help="Rebuild a missing Integration Proposal for an already-SUCCEEDED task "
+             "(never re-runs the Agent or the Quality Gate).",
+    )
+    recover.add_argument("task_id")
+    recover.add_argument("--repo", required=True)
+    recover.add_argument("--project-id", required=True)
+    recover.add_argument("--project-name", default="project")
+    recover.set_defaults(func=cmd_recover_proposal)
 
     integrate = sub.add_parser("integrate", help="Integrate an approved proposal and run post-integration checks.")
     integrate.add_argument("task_id")

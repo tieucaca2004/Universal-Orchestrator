@@ -36,7 +36,7 @@ import subprocess
 from dataclasses import dataclass
 
 from universal_orchestrator.core.engine import OrchestrationEngine
-from universal_orchestrator.core.models import ProjectProfile, TaskError
+from universal_orchestrator.core.models import ProjectProfile, TaskError, TaskStatus
 from universal_orchestrator.errors import OrchestratorError
 from universal_orchestrator.execution.adapter import ExecutionPolicy, ExecutionResult
 from universal_orchestrator.execution.approval import IntegrationProposal
@@ -267,6 +267,74 @@ class GovernedPipeline:
             policy=policy, workspace_transfer=workspace_transfer,
         )
         return self.evaluate_and_propose(task_id, project, criteria_evidence=criteria_evidence)
+
+    def recover_proposal(
+        self, task_id: str, project: ProjectProfile
+    ) -> IntegrationProposal:
+        """Milestone 7, Proposal Recovery CLI.
+
+        A documented, narrow exception to "reuse evaluate_and_propose()":
+        that method *cannot* be safely re-invoked for a task that is
+        already SUCCEEDED — it unconditionally calls
+        `TaskManager.succeed()` as its first write, and
+        `lifecycle.validate_transition` correctly refuses a second
+        SUCCEEDED transition for an already-terminal task
+        (`ALLOWED_TRANSITIONS[SUCCEEDED]` is empty — Milestone 2,
+        unchanged). A task can reach exactly "SUCCEEDED, Worktree
+        still QUALITY_CHECK, no integration proposal on record" two
+        real ways: a crash/exception between `succeed()` and
+        `build_integration_proposal()` inside a single
+        `evaluate_and_propose()` call (e.g. a Conflict Manager git
+        timeout), or `TaskManager.resolve_interrupted(CONFIRMED_
+        SUCCEEDED)` after a restart. Either way, re-running the
+        quality gate or the Agent is wrong — the SUCCEEDED decision
+        already stands; only steps 6-8 of `evaluate_and_propose()`'s
+        own documented sequence (Conflict Manager check, build the
+        proposal, transition the Worktree) ever needed to happen
+        again, so this method reuses exactly those same calls, on the
+        same collaborators, never engine.execute(), never an
+        ExecutionAdapter, never the Agent.
+
+        Raises `errors.OrchestratorError` if any precondition is not
+        met: task not SUCCEEDED, no persisted ExecutionResult, Worktree
+        not QUALITY_CHECK, or a proposal already exists — refuses
+        outright rather than guessing."""
+        task = self.engine.manager.get(task_id)
+        if task.status is not TaskStatus.SUCCEEDED:
+            raise OrchestratorError(
+                f"task '{task_id}' is '{task.status.value}', not SUCCEEDED — "
+                "recover-proposal only applies to an already-SUCCEEDED task"
+            )
+
+        results = self.engine.manager.get_execution_results(task_id)
+        if not results:
+            raise OrchestratorError(f"task '{task_id}' has no persisted ExecutionResult")
+
+        handle = self.worktrees.get(task_id)
+        if handle.status is not WorktreeStatus.QUALITY_CHECK:
+            raise OrchestratorError(
+                f"task '{task_id}': Worktree is '{handle.status.value}', not "
+                "QUALITY_CHECK — recover-proposal refuses to guess at a "
+                "Worktree state it did not produce"
+            )
+
+        if self.approvals.get_proposal(task_id) is not None:
+            raise OrchestratorError(
+                f"task '{task_id}' already has an integration proposal on record"
+            )
+
+        verdict_report = self.quality.latest(task_id, level="task")
+        quality_verdict = verdict_report.verdict.value if verdict_report else "NOT_VERIFIED"
+
+        conflict_report = self.conflicts.check(project.repository_path, task_id)
+        proposal = self.approvals.build_integration_proposal(
+            project.repository_path, handle, conflict_report, quality_verdict
+        )
+        if conflict_report.blocks_integration:
+            self.worktrees.transition(task_id, WorktreeStatus.NEEDS_REVIEW)
+        else:
+            self.worktrees.transition(task_id, WorktreeStatus.AWAITING_APPROVAL)
+        return proposal
 
     def integrate_after_approval(
         self, task_id: str, project: ProjectProfile
