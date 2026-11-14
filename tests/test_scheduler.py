@@ -30,7 +30,7 @@ from universal_orchestrator.core.models import (
     ProviderStatus,
     TaskRequest,
 )
-from universal_orchestrator.core.scheduler import Scheduler
+from universal_orchestrator.core.scheduler import Scheduler, default_input_context
 from universal_orchestrator.core.state import StateManager
 from universal_orchestrator.execution.adapter import (
     ExecutionAdapter,
@@ -78,6 +78,7 @@ class BlockingAdapter(ExecutionAdapter):
         self.active = 0
         self.max_active = 0
         self.calls: list[str] = []
+        self.input_contexts: dict[str, str] = {}
 
     def verify(self) -> VerificationStatus:
         return VerificationStatus.AVAILABLE
@@ -87,6 +88,7 @@ class BlockingAdapter(ExecutionAdapter):
             self.active += 1
             self.max_active = max(self.max_active, self.active)
             self.calls.append(request.task_id)
+            self.input_contexts[request.task_id] = request.input_context
         self.started.set()
         self.release.wait(timeout=10)
         Path(request.working_directory, "agent_output.txt").write_text("fake output\n")
@@ -343,6 +345,68 @@ class ShutdownDrainTests(SchedulerTestCase):
 
         scheduler.shutdown()
         self.assertIsNone(leases.current().holder_id)
+
+
+class InputContextTests(SchedulerTestCase):
+    """Regression coverage for the empty-prompt dispatch bug: before
+    this fix, `_run_task` called `pipeline.dispatch()` with no
+    `input_context` at all, so every Scheduler-initiated Agent call
+    silently fell back to `GovernedPipeline.dispatch()`'s own
+    `input_context: str = ""` default -- a real Agent run with no
+    prompt. `default_input_context()` is the fix: it is the Scheduler's
+    only source for a prompt (no human types one in per task), built
+    from the task's own `TaskSpecification` (Milestone 2's Task
+    Analyzer output), never fabricated."""
+
+    def test_default_input_context_builds_a_real_prompt_from_the_specification(self):
+        from universal_orchestrator.core.models import Task, TaskSpecification, TaskStatus
+
+        spec = TaskSpecification(
+            objective="Add a health-check endpoint",
+            scope="Only the HTTP layer",
+            constraints=["No new dependencies"],
+            expected_deliverables=["GET /health returns 200"],
+            acceptance_criteria=["curl /health exits 0"],
+        )
+        task = Task(task_id="t1", title="t", project_id="p", status=TaskStatus.ANALYZED, specification=spec)
+
+        context = default_input_context(task)
+
+        self.assertIn("Add a health-check endpoint", context)
+        self.assertIn("Only the HTTP layer", context)
+        self.assertIn("No new dependencies", context)
+        self.assertIn("GET /health returns 200", context)
+        self.assertIn("curl /health exits 0", context)
+
+    def test_default_input_context_is_empty_string_never_fabricated_without_a_specification(self):
+        from universal_orchestrator.core.models import Task, TaskStatus
+
+        task = Task(task_id="t1", title="t", project_id="p", status=TaskStatus.CREATED)
+        self.assertEqual(default_input_context(task), "")
+
+    def test_scheduler_dispatched_task_receives_a_non_empty_input_context(self):
+        from universal_orchestrator.core.models import TaskSpecification
+
+        task = self.engine.manager.create_task("t", self.project.project_id)
+        self.engine.manager.attach_specification(
+            task.task_id,
+            TaskSpecification(objective="Do the real work", scope="Everything in scope"),
+        )
+        self.adapter.release.set()
+
+        scheduler = Scheduler(self.state, self.engine, self.pipeline, self.projects, settings=self.settings)
+        scheduler.start()
+        scheduler.run_once()
+
+        leases = SchedulerLeaseManager(self.state)
+        self.assertTrue(_wait_until(
+            lambda: leases.get_claim(task.task_id) and leases.get_claim(task.task_id).status == ClaimStatus.COMPLETED
+        ))
+
+        received = self.adapter.input_contexts[task.task_id]
+        self.assertNotEqual(received, "")
+        self.assertIn("Do the real work", received)
+        scheduler.shutdown()
 
 
 if __name__ == "__main__":

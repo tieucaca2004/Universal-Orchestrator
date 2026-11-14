@@ -71,6 +71,30 @@ from universal_orchestrator.registry.projects import ProjectRegistry
 _LOG = get_logger("scheduler")
 
 CriteriaEvidenceProvider = Callable[[str], "dict[str, bool] | None"]
+InputContextBuilder = Callable[["object"], str]
+
+
+def default_input_context(task) -> str:
+    """`GovernedPipeline.dispatch()`'s `input_context` has no default
+    of its own (Milestone 4: the caller always supplies it explicitly
+    — e.g. `orchestrator_cli submit --input-context`). A Scheduler
+    dispatching automatically, with no human typing one in per task,
+    has no other source for a meaningful prompt than the task's own
+    `TaskSpecification` — already built for exactly this by the Task
+    Analyzer (Milestone 2) and otherwise unused by any M1-M6 dispatch
+    path. Returns "" (never fabricated filler) if there is no
+    specification at all."""
+    spec = task.specification
+    if spec is None:
+        return ""
+    parts = [f"Objective: {spec.objective}", f"Scope: {spec.scope}"]
+    if spec.constraints:
+        parts.append("Constraints: " + "; ".join(spec.constraints))
+    if spec.expected_deliverables:
+        parts.append("Expected deliverables: " + "; ".join(spec.expected_deliverables))
+    if spec.acceptance_criteria:
+        parts.append("Acceptance criteria: " + "; ".join(spec.acceptance_criteria))
+    return "\n".join(parts)
 
 
 def _utcnow() -> datetime:
@@ -89,6 +113,7 @@ class Scheduler:
         holder_id: str | None = None,
         criteria_evidence_provider: CriteriaEvidenceProvider | None = None,
         workspace_transfer: HermesWorkspaceTransfer | None = None,
+        input_context_builder: InputContextBuilder = default_input_context,
     ) -> None:
         self._state = state
         self._engine = engine
@@ -98,6 +123,7 @@ class Scheduler:
         self._holder_id = holder_id or new_holder_id()
         self._evidence_provider = criteria_evidence_provider
         self._workspace_transfer = workspace_transfer
+        self._input_context_builder = input_context_builder
         self._leases = SchedulerLeaseManager(state)
         self._epoch: int | None = None
         self._stop_event = Event()
@@ -283,7 +309,11 @@ class Scheduler:
 
         try:
             self._ensure_routed(task_id, project)
-            self._pipeline.dispatch(task_id, project, workspace_transfer=self._workspace_transfer)
+            input_context = self._input_context_builder(task)
+            self._pipeline.dispatch(
+                task_id, project,
+                input_context=input_context, workspace_transfer=self._workspace_transfer,
+            )
         except Exception:
             _LOG.exception("dispatch failed", extra={"fields": {"task_id": task_id}})
             self._finish_claim(task_id)
