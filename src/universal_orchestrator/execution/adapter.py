@@ -81,6 +81,16 @@ class PermissionMode(enum.Enum):
 class ExecutionPolicy:
     permission_mode: PermissionMode = PermissionMode.READ_ONLY
     max_output_bytes: int = 65536
+    # Audit Finding C-3: `WORKTREE_WRITE`'s bwrap sandbox (see
+    # execution.claude_code._build_sandboxed_command) isolates the
+    # filesystem but, by default, not the network — Claude Code CLI
+    # itself needs live network access to reach the Anthropic API, so
+    # unsharing the network namespace by default would make every
+    # execution fail outright. Set this to `False` only for a
+    # configuration that genuinely needs no network at all; doing so
+    # with the real `claude`/`hermes` adapters as they exist today
+    # will break them.
+    allow_network: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

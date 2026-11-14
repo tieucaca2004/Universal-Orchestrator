@@ -679,6 +679,79 @@ class WorktreeWriteModeTests(AdapterTestCase):
         # Never ran the inner command at all -- no side effect exists.
         self.assertFalse((self.sandbox / "inside_worktree.txt").exists())
 
+    def test_build_sandboxed_command_default_keeps_network_shared(self):
+        """Audit Finding C-3 regression test: the default must stay
+        unchanged -- `claude` itself needs network access, so
+        `allow_network` defaults to `True` and `--unshare-net` is
+        never added unless explicitly opted into."""
+        import universal_orchestrator.execution.claude_code as claude_code_module
+
+        command = claude_code_module._build_sandboxed_command(["echo", "hi"], str(self.sandbox))
+        self.assertNotIn("--unshare-net", command)
+
+    def test_build_sandboxed_command_opt_in_adds_unshare_net(self):
+        import universal_orchestrator.execution.claude_code as claude_code_module
+
+        command = claude_code_module._build_sandboxed_command(
+            ["echo", "hi"], str(self.sandbox), allow_network=False
+        )
+        self.assertIn("--unshare-net", command)
+
+    def test_worktree_write_mode_network_isolation_blocks_a_real_outbound_connection(self):
+        """Not a convention check -- with `allow_network=False`, a
+        real outbound TCP connect attempt from inside the real
+        sandbox must really fail at the kernel level (ENETUNREACH),
+        exactly as empirically verified for this fix. Skips (rather
+        than fails) in an environment with no outbound network at
+        all, consistent with this module's own 'must pass with no
+        network access' baseline -- that baseline describes the test
+        *runner's* needs, not a claim this adapter enforces isolation
+        by default."""
+        if not self._bwrap_available():
+            self.skipTest("bwrap not installed on this host")
+
+        import socket
+
+        try:
+            socket.create_connection(("8.8.8.8", 53), timeout=2).close()
+        except OSError:
+            self.skipTest("no outbound network available in this environment")
+
+        source = textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import json, socket, sys
+            args = sys.argv[1:]
+            if args == ["--version"]:
+                print("9.9.9 (Fake Claude)"); sys.exit(0)
+            if args == ["--help"]:
+                print(
+                    "-p, --print\\n--output-format\\n--tools\\n--no-session-persistence\\n"
+                    "--safe-mode\\n--strict-mcp-config\\n--disable-slash-commands\\n--setting-sources\\n"
+                )
+                sys.exit(0)
+            if len(args) >= 2 and args[0:2] == ["auth", "status"]:
+                print(json.dumps({"loggedIn": True})); sys.exit(0)
+            try:
+                socket.create_connection(("8.8.8.8", 53), timeout=3).close()
+                reached = True
+            except OSError as e:
+                reached = False
+            print(json.dumps({"is_error": False, "result": "done", "network_reached": reached}))
+            sys.exit(0)
+            """
+        )
+        adapter = self._fake_adapter(source)
+        request = self._request(
+            "hello",
+            policy=ExecutionPolicy(permission_mode=PermissionMode.WORKTREE_WRITE, allow_network=False),
+        )
+
+        result = adapter.execute(request)
+
+        self.assertIs(result.outcome, ExecutionOutcome.COMPLETED)
+        self.assertFalse(result.structured_output["network_reached"])
+
     def test_worktree_write_mode_wraps_with_bwrap_and_bypass_permissions_and_scratch_binds(self):
         if not self._bwrap_available():
             self.skipTest("bwrap not installed on this host")

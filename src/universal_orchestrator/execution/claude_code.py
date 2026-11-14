@@ -53,6 +53,19 @@ Worktree failing with a real "Read-only file system" OS error. If
 (`sandbox_unavailable`) rather than ever running with write tools
 enabled and no real containment.
 
+Audit Finding C-3, stated plainly, not hidden: this is filesystem
+containment only. By default the sandboxed `claude` process keeps
+full host network access — the same honest limitation already
+documented for `READ_ONLY` mode in docs/EXECUTION_CLAUDE_CODE.md's
+"Security posture" table — because `claude` itself needs live
+network access to reach the Anthropic API; unsharing the network
+namespace unconditionally would make every `WORKTREE_WRITE`
+execution fail outright, not more secure. `ExecutionPolicy.
+allow_network=False` plumbs through to a real `--unshare-net` (see
+`_build_sandboxed_command`) for the rare configuration that
+genuinely needs no network at all — never meaningful with either
+adapter that exists today.
+
 See "Known limitations" in the docs for exactly what is and is
 not covered.
 """
@@ -139,7 +152,9 @@ _CLAUDE_SESSION_ENV_DIR = str(Path.home() / ".claude" / "session-env")
 _CLAUDE_TMP_SCRATCH_DIR = f"/tmp/claude-{os.getuid()}"
 
 
-def _build_sandboxed_command(inner_command: list[str], worktree_path: str) -> list[str]:
+def _build_sandboxed_command(
+    inner_command: list[str], worktree_path: str, *, allow_network: bool = True
+) -> list[str]:
     """Wraps `inner_command` so that, enforced by the kernel (Linux user
     namespaces via `bwrap`), every path on the filesystem is read-only
     to the sandboxed process *except* `worktree_path` and Claude's own
@@ -149,9 +164,20 @@ def _build_sandboxed_command(inner_command: list[str], worktree_path: str) -> li
     this session, outside any test harness, that an absolute-path
     write attempt to a path other than these bound paths fails with a
     real "Read-only file system" OS error — not a convention, not
-    something `cwd=` alone would have provided."""
+    something `cwd=` alone would have provided.
+
+    Audit Finding C-3: filesystem containment here has never implied
+    network isolation — `allow_network=True` (the default, unchanged)
+    leaves the network namespace shared, because `claude` itself needs
+    live network access to reach the Anthropic API; setting it to
+    `False` adds `--unshare-net`, empirically verified this session to
+    turn a real outbound TCP connect into an immediate kernel-level
+    `OSError: [Errno 101] Network is unreachable` — but doing so with
+    the real `claude` CLI as its own sandboxed process will break
+    every execution, since that CLI cannot then reach its own API."""
     os.makedirs(_CLAUDE_SESSION_ENV_DIR, exist_ok=True)
     os.makedirs(_CLAUDE_TMP_SCRATCH_DIR, exist_ok=True)
+    network_flags = [] if allow_network else ["--unshare-net"]
     return [
         _SANDBOX_BIN,
         "--ro-bind", "/", "/",
@@ -161,6 +187,7 @@ def _build_sandboxed_command(inner_command: list[str], worktree_path: str) -> li
         "--bind", _CLAUDE_SESSION_ENV_DIR, _CLAUDE_SESSION_ENV_DIR,
         "--bind", _CLAUDE_TMP_SCRATCH_DIR, _CLAUDE_TMP_SCRATCH_DIR,
         "--unshare-pid",
+        *network_flags,
         "--die-with-parent",
         "--chdir", worktree_path,
         "--",
@@ -433,7 +460,9 @@ class ClaudeCodeAdapter(ExecutionAdapter):
             # CLI's own permission layer would have decided.
             command = [*command, "--permission-mode", "bypassPermissions"]
             # Real, kernel-enforced containment — not `cwd=` alone.
-            command = _build_sandboxed_command(command, request.working_directory)
+            command = _build_sandboxed_command(
+                command, request.working_directory, allow_network=request.policy.allow_network
+            )
 
         started_at = datetime.now(timezone.utc)
         start_perf = time.monotonic()
