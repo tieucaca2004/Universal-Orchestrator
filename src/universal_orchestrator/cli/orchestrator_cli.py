@@ -319,7 +319,13 @@ def cmd_propose(args: argparse.Namespace) -> int:
             criterion, _, value = item.partition("=")
             evidence[criterion] = value.strip().lower() in ("1", "true", "yes", "pass")
 
-        proposal = pipeline.evaluate_and_propose(args.task_id, project, criteria_evidence=evidence or None)
+        results = engine.manager.get_execution_results(args.task_id)
+        if results:
+            print(f"Evaluating against EXECUTION_ID={results[-1].execution_id}")
+        proposal = pipeline.evaluate_and_propose(
+            args.task_id, project, criteria_evidence=evidence or None,
+            expected_execution_id=args.execution_id,
+        )
         if proposal is None:
             print("Quality Gate did not PASS. No Integration Proposal created.")
             print(f"Task status: {engine.manager.get(args.task_id).status.value}")
@@ -427,6 +433,13 @@ def build_parser() -> argparse.ArgumentParser:
     propose.add_argument("--project-id", required=True)
     propose.add_argument("--project-name", default="project")
     propose.add_argument("--evidence", action="append", default=[], help="criterion=true|false")
+    propose.add_argument(
+        "--execution-id", default=None,
+        help="The execution_id this evidence was actually collected against. If the task's "
+             "latest execution is a different one by the time this runs, propose refuses "
+             "rather than pairing stale evidence with it. Omit to use whichever is latest "
+             "(prior behavior, unchanged).",
+    )
     propose.set_defaults(func=cmd_propose)
 
     recover = sub.add_parser(

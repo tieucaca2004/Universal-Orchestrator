@@ -177,6 +177,7 @@ class GovernedPipeline:
         project: ProjectProfile,
         *,
         criteria_evidence: dict[str, bool] | None = None,
+        expected_execution_id: str | None = None,
     ) -> IntegrationProposal | None:
         """Steps 5-8. Requires `dispatch()` to have already run for this
         exact task (its Worktree must be in `QUALITY_CHECK`) — refuses
@@ -185,6 +186,18 @@ class GovernedPipeline:
         (the same one `dispatch()` returned) — `criteria_evidence` is
         the caller's real judgment of that real result, collected only
         now, never before execution.
+
+        Audit Finding C-13: a task can accumulate more than one
+        `ExecutionResult` over its lifetime (retry after INTERRUPTED,
+        a second `dispatch()`...), and this always evaluates
+        `criteria_evidence` against whichever one is currently latest.
+        If the caller collected that evidence by reviewing a
+        *specific* execution (identified by its `execution_id`) and
+        passes it as `expected_execution_id`, this refuses to proceed
+        when the latest result is a different one — evidence is never
+        silently paired with a result the caller never actually
+        looked at. Omitting it (the default) preserves the exact
+        prior behavior for every existing caller.
 
         Returns `None` when the task failed its own Quality Gate —
         there is nothing to propose, so no `IntegrationProposal` is
@@ -205,6 +218,13 @@ class GovernedPipeline:
         if not results:
             raise OrchestratorError(f"task '{task_id}' has no recorded ExecutionResult")
         result = results[-1]
+        if expected_execution_id is not None and result.execution_id != expected_execution_id:
+            raise OrchestratorError(
+                f"task '{task_id}': evidence was collected for execution "
+                f"'{expected_execution_id}', but the latest execution is now "
+                f"'{result.execution_id}' — refusing to pair stale evidence "
+                "with a different execution"
+            )
 
         # -- 5: task-level Quality Gate, against the real result ------------
         quality_report = self.quality.evaluate_task(

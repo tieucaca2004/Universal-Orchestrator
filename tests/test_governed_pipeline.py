@@ -28,6 +28,7 @@ from universal_orchestrator.core.models import (
 )
 from universal_orchestrator.core.state import StateManager
 from universal_orchestrator.errors import ApprovalRequiredError, OrchestratorError
+from universal_orchestrator.execution.adapter import ExecutionOutcome, ExecutionResult
 from universal_orchestrator.execution.approval import ApprovalDecisionType
 from universal_orchestrator.execution.approval_manager import ApprovalGate
 from universal_orchestrator.execution.claude_code import ClaudeCodeAdapter
@@ -317,6 +318,45 @@ class EvidenceLifecycleTests(GovernedPipelineTestCase):
         self.assertIsNone(proposal)
         self.assertEqual(self.engine.manager.get(task_id).status.value, "failed")
         self.assertEqual(self.worktrees.get(task_id).status, WorktreeStatus.NEEDS_REVIEW)
+
+    def test_evaluate_and_propose_refuses_evidence_collected_against_a_stale_execution(self):
+        """Audit Finding C-13 regression test: evidence collected by
+        reviewing one execution must never be silently applied to a
+        *different*, later execution the caller never looked at."""
+        task_id = self._submit_and_route()
+        first_result = self.pipeline.dispatch(task_id, self.project)
+
+        # Simulates a second execution having landed (e.g. a retried
+        # dispatch through some other path) between the human
+        # reviewing `first_result` and running `propose`. `started_at`
+        # must be later -- `get_execution_results` orders by it.
+        from datetime import datetime, timedelta, timezone
+
+        later = (first_result.started_at or datetime.now(timezone.utc)) + timedelta(seconds=1)
+        self.state.save_execution_result(
+            ExecutionResult(
+                execution_id="exec_later", task_id=task_id,
+                outcome=ExecutionOutcome.COMPLETED, exit_code=0,
+                started_at=later,
+            )
+        )
+
+        with self.assertRaises(OrchestratorError):
+            self.pipeline.evaluate_and_propose(
+                task_id, self.project,
+                criteria_evidence={"creates agent_output.txt": True},
+                expected_execution_id=first_result.execution_id,
+            )
+        # Refused before any mutation -- still QUALITY_CHECK, not FAILED.
+        self.assertEqual(self.worktrees.get(task_id).status, WorktreeStatus.QUALITY_CHECK)
+
+        # The *current* execution_id is accepted normally.
+        proposal = self.pipeline.evaluate_and_propose(
+            task_id, self.project,
+            criteria_evidence={"creates agent_output.txt": True},
+            expected_execution_id="exec_later",
+        )
+        self.assertIsNotNone(proposal)
 
     def test_submit_for_approval_wrapper_still_works_unchanged(self):
         """Backward compatibility: the single-call wrapper is still
