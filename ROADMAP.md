@@ -687,6 +687,24 @@ scope. No connection between Orchestrator A and Orchestrator B is
 designed, implied, or dependency-wired here or anywhere in this
 document.
 
+**Governance status, recorded by the M1–M7 audit (2026-11-14) — audit
+Finding C-10.** Code implementing a Cycle & Deadlock Detector,
+scheduler lease fencing primitives, a State-aware Stall Detector, a
+Task Scheduler, and a Proposal Recovery CLI was committed under an
+"M7 Component A/B/C/D" / "M7 Phase 2" label with no corresponding
+entry ever added to this document, and with no Founder-approval
+record this audit could locate anywhere in the repository. This is
+an **implementation-authorization gap, not a milestone acceptance**:
+the code exists and, as of this same audit/remediation pass, its
+most serious defects (a bootstrap/recovery race and several lower-
+severity gaps) have been found and fixed, with real regression
+tests. That is evidence the *code* is now in better shape — it is
+**not** a Founder approval of M7's scope, and this note does not
+assert one. §11's status above (**M7 — NOT APPROVED**) stands
+unchanged until the Founder explicitly decides to approve the scope
+as built, require changes to it, or reject/roll it back. No date or
+signature of approval is recorded here because none occurred.
+
 ## 12. M8 — End-to-End Acceptance — **PLANNED (provisional shape only), NOT APPROVED, NOT IMPLEMENTED**
 
 - **Objective:** final validation that the full M1–M6 pipeline (and
@@ -746,7 +764,7 @@ and have not been committed.
 4. **M4 — Claude CLI Adapter and non-interactive execution verification.** DECIDED, IMPLEMENTED, TESTED (unit/integration, this session); VERIFIED (historical real smoke test, not re-run this session). **Kept, not removed** — see §D.
 5. **M5 — Hermes Adapter and execution verification.** DECIDED, IMPLEMENTED, TESTED (unit/integration, this session); VERIFIED (historical real smoke test, not re-run this session). **Kept, not removed** — see §D.
 6. **M6 — Git Worktree Manager, Conflict Manager, Approval Gate, Quality Gate.** IMPLEMENTED, TESTED, VERIFIED. **COMPLETE / ACCEPTED / CLOSED** (Founder decision) — see §9, §10. Serves Orchestrator A only.
-7. **M7 — NOT APPROVED.** Scope requires architecture review and explicit Founder approval.
+7. **M7 — NOT APPROVED.** Scope requires architecture review and explicit Founder approval. Code exists in the repository (Components A–D, Phase 2 fencing) with no corresponding approval record — see §11's governance-status note (audit Finding C-10). Implementation existing is not acceptance.
 8. **M8 — End-to-end testing, backup, recovery, final acceptance.** PLANNED (provisional shape only), NOT APPROVED, NOT IMPLEMENTED; gated on M6 and M7.
 
 **Orchestrator B ("3070"): LOCKED / FROZEN / NOT STARTED / OUT OF SCOPE.**

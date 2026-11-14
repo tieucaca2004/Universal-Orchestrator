@@ -14,6 +14,27 @@ SUPERSEDED / UNKNOWN) is used exactly as defined in
 substitutes for VERIFIED, and a component's documentation existing is
 never read as the component existing.
 
+**STATUS UPDATE (2026-11-14, audit Finding C-11) — this document
+predates Milestone 6's closure and was never updated afterward.**
+Per this document's own precedence rule above, ROADMAP.md governs:
+M6 is **IMPLEMENTED, TESTED, VERIFIED, COMPLETE / ACCEPTED / CLOSED**
+(ROADMAP.md §9–10). Specifically, every place below that still marks
+**Approval Gate**, **Quality Gate**, **Git Worktree Manager**, or
+**Conflict Manager** as NOT IMPLEMENTED or PLANNED — including §B's
+component table, §D's "Security posture" table, and §H's concurrency
+table — is **stale**; all four are real, implemented, tested modules
+(`execution/approval_manager.py`, `execution/quality_manager.py`,
+`execution/worktree_manager.py`, `execution/conflict_manager.py`)
+wired together by `core/governed_pipeline.py`. Separately, M7 (Cycle
+& Deadlock Detector, scheduler lease fencing, Stall Detector, Task
+Scheduler, Proposal Recovery CLI) now also exists in code — see
+ROADMAP.md §11's governance-status note (audit Finding C-10) for why
+that is an implementation fact, not a milestone-acceptance fact.
+This document's detailed per-component tables below are left as
+historical record rather than rewritten table-by-table (avoiding an
+unnecessary full rewrite); this note is the authoritative correction
+for all of them at once.
+
 ---
 
 ## A. System Context
@@ -25,11 +46,18 @@ should do each piece, runs it, and tracks what happened. Universal-
 Orchestrator is that single place.
 
 **How the Founder interacts with it:** the Founder gives a goal to
-exactly one entry point (today, in practice, a direct call into
-`OrchestrationEngine.submit()`; there is no CLI, API, or UI front-end
-yet — see §I). The Founder does not call an adapter directly, does not
-pick a Git branch strategy per task, and does not manually track task
-state — those are this system's job once a goal is submitted.
+`OrchestrationEngine.submit()`, reached in practice through one of
+four real, `python3 -m`-invocable CLI entrypoints under
+`src/universal_orchestrator/cli/` — `orchestrator_cli` (submit /
+extract-claude-files / propose / recover-proposal / integrate),
+`approval_cli`, `alerts_cli`, and `scheduler_cli` (audit Finding
+C-11: this sentence previously, incorrectly, said no such entrypoint
+existed — these four were added across the M6/M7 remediation
+commits and are the real, documented way this system is actually
+run; still no separate API or UI front-end). The Founder does not
+call an adapter directly, does not pick a Git branch strategy per
+task, and does not manually track task state — those are this
+system's job once a goal is submitted.
 
 **System boundary:** Universal-Orchestrator contains its own task
 model, state store, registries, routing logic, and execution adapters.

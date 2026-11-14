@@ -10,14 +10,20 @@ by absorbing or copying them.
 
 ## Status
 
-Milestone 5 — Hermes Agent Adapter and execution verification,
-registered alongside the Claude Code CLI Adapter (Milestone 4, plus its
-post-audit remediation) through the same `ExecutionAdapter` contract
-and `AdapterRegistry`. See [ROADMAP.md](ROADMAP.md) for the
-authoritative milestone status, M6–M8 plans, and the Orchestrator A /
-Orchestrator B distinction; [ARCHITECTURE.md](ARCHITECTURE.md) for the
-component map and the Appendix noting items still awaiting a Founder
-decision;
+Milestone 6 (Git Worktree Manager, Conflict Manager, Approval Gate,
+Quality Gate) is **IMPLEMENTED, TESTED, VERIFIED, COMPLETE / ACCEPTED
+/ CLOSED**. Milestone 7 (Cycle & Deadlock Detector, scheduler lease
+fencing, State-aware Stall Detector, Task Scheduler, Proposal Recovery
+CLI) **exists in code but has no recorded Founder approval** — see
+ROADMAP.md §11. A full M1–M7 audit and remediation pass (2026-11-14)
+fixed several confirmed defects found in M7 and earlier milestones;
+see the repository's commit history for the itemized findings and
+fixes. This note corrects a previously stale claim here that the
+project was still at Milestone 5 (audit Finding C-11). See
+[ROADMAP.md](ROADMAP.md) for the authoritative milestone status,
+M8 plans, and the Orchestrator A / Orchestrator B distinction;
+[ARCHITECTURE.md](ARCHITECTURE.md) for the component map and the
+Appendix noting items still awaiting a Founder decision;
 [docs/TASK_LIFECYCLE.md](docs/TASK_LIFECYCLE.md)
 for the task state machine; [docs/REGISTRIES.md](docs/REGISTRIES.md) for
 the registry schemas; [docs/ROUTING.md](docs/ROUTING.md) for the routing
