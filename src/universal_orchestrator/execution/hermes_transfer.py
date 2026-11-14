@@ -35,6 +35,7 @@ risk is eliminated.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import uuid
@@ -65,18 +66,42 @@ def _new_staging_path() -> str:
     return f"/tmp/uo_exec_{uuid.uuid4().hex[:12]}"
 
 
-def _host_manifest(host_path: str) -> dict[str, int]:
-    """path (relative to host_path) -> size in bytes, for every real
-    file. The one source of truth `copy_in`/`copy_out` compare against."""
+_SHA256_PROBE_TIMEOUT_SECONDS = 10.0
+
+
+def _sha256_hex(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _host_manifest(host_path: str, *, include_hash: bool) -> dict[str, tuple[int, str | None]]:
+    """path (relative to host_path) -> (size in bytes, sha256 hex or
+    None), for every real file. The one source of truth `copy_in`/
+    `copy_out` compare against.
+
+    Audit Finding 16-E: size/count alone cannot distinguish two
+    different files of identical byte length. `include_hash` is
+    decided once per transfer by probing the container for
+    `sha256sum` (see `HermesWorkspaceTransfer._ensure_hashing_probed`)
+    — when unavailable there, this omits the hash too, so host and
+    container manifests stay directly comparable; size/count is the
+    documented fallback, not silently a weaker, mismatched check."""
     root = Path(host_path)
-    manifest: dict[str, int] = {}
+    manifest: dict[str, tuple[int, str | None]] = {}
     for path in root.rglob("*"):
         if path.is_file() and ".git" not in path.parts:
-            manifest[str(path.relative_to(root))] = path.stat().st_size
+            size = path.stat().st_size
+            digest = _sha256_hex(path) if include_hash else None
+            manifest[str(path.relative_to(root))] = (size, digest)
     return manifest
 
 
-def _container_manifest(docker_bin: str, container: str, staging_path: str) -> dict[str, int]:
+def _container_manifest(
+    docker_bin: str, container: str, staging_path: str, *, include_hash: bool
+) -> dict[str, tuple[int, str | None]]:
     result = subprocess.run(
         [docker_bin, "exec", container, "find", staging_path, "-type", "f", "-printf", "%P\t%s\n"],
         env=_env(),
@@ -86,15 +111,35 @@ def _container_manifest(docker_bin: str, container: str, staging_path: str) -> d
     )
     if result.returncode != 0:
         raise HermesTransferError(f"could not list container staging directory: {result.stderr.strip()}")
-    manifest: dict[str, int] = {}
+    sizes: dict[str, int] = {}
     for line in result.stdout.splitlines():
         if not line.strip():
             continue
         rel_path, _, size = line.rpartition("\t")
         if ".git" in Path(rel_path).parts:
             continue
-        manifest[rel_path] = int(size)
-    return manifest
+        sizes[rel_path] = int(size)
+
+    if not include_hash or not sizes:
+        return {path: (size, None) for path, size in sizes.items()}
+
+    hash_result = subprocess.run(
+        [docker_bin, "exec", container, "find", staging_path, "-type", "f", "-exec", "sha256sum", "{}", "+"],
+        env=_env(), capture_output=True, text=True, timeout=_TIMEOUT_SECONDS,
+    )
+    if hash_result.returncode != 0:
+        raise HermesTransferError(
+            f"could not hash container staging directory: {hash_result.stderr.strip()}"
+        )
+    hashes: dict[str, str] = {}
+    prefix = staging_path.rstrip("/") + "/"
+    for line in hash_result.stdout.splitlines():
+        if not line.strip():
+            continue
+        digest, _, full_path = line.partition("  ")
+        rel_path = full_path[len(prefix):] if full_path.startswith(prefix) else full_path
+        hashes[rel_path] = digest
+    return {path: (size, hashes.get(path)) for path, size in sizes.items()}
 
 
 class HermesWorkspaceTransfer:
@@ -107,12 +152,30 @@ class HermesWorkspaceTransfer:
         self._container = container
         self._docker_bin = docker_bin
         self._staging_path: str | None = None
-        self._host_manifest_at_copy_in: dict[str, int] | None = None
+        self._host_manifest_at_copy_in: dict[str, tuple[int, str | None]] | None = None
+        self._hashing_supported: bool | None = None
+
+    def _ensure_hashing_probed(self) -> bool:
+        """Audit Finding 16-E: probed once per instance, not assumed.
+        If the container image lacks `sha256sum` (uncertain across
+        arbitrary Hermes images, and this cannot be verified against
+        a real container in this environment), this falls back to
+        the prior size/count-only check rather than failing closed —
+        a regression in availability is worse than the integrity gap
+        this is meant to narrow."""
+        if self._hashing_supported is None:
+            probe = subprocess.run(
+                [self._docker_bin, "exec", self._container, "sh", "-c", "command -v sha256sum"],
+                env=_env(), capture_output=True, text=True, timeout=_SHA256_PROBE_TIMEOUT_SECONDS,
+            )
+            self._hashing_supported = probe.returncode == 0
+        return self._hashing_supported
 
     def copy_in(self, host_worktree_path: str) -> str:
         if self._staging_path is not None:
             raise HermesTransferError("copy_in() already called for this transfer instance")
 
+        include_hash = self._ensure_hashing_probed()
         staging_path = _new_staging_path()
         mkdir = subprocess.run(
             [self._docker_bin, "exec", self._container, "mkdir", "-p", staging_path],
@@ -121,7 +184,7 @@ class HermesWorkspaceTransfer:
         if mkdir.returncode != 0:
             raise HermesTransferError(f"could not create staging directory: {mkdir.stderr.strip()}")
 
-        host_manifest = _host_manifest(host_worktree_path)
+        host_manifest = _host_manifest(host_worktree_path, include_hash=include_hash)
         copy = subprocess.run(
             [self._docker_bin, "cp", f"{host_worktree_path}/.", f"{self._container}:{staging_path}"],
             env=_env(), capture_output=True, text=True, timeout=_TIMEOUT_SECONDS,
@@ -129,11 +192,13 @@ class HermesWorkspaceTransfer:
         if copy.returncode != 0:
             raise HermesTransferError(f"docker cp (copy-in) failed: {copy.stderr.strip()}")
 
-        container_manifest = _container_manifest(self._docker_bin, self._container, staging_path)
+        container_manifest = _container_manifest(
+            self._docker_bin, self._container, staging_path, include_hash=include_hash
+        )
         if container_manifest != host_manifest:
             raise HermesTransferError(
-                f"copy-in incomplete: host has {len(host_manifest)} file(s), "
-                f"container staging has {len(container_manifest)}"
+                f"copy-in incomplete or corrupted: host has {len(host_manifest)} file(s), "
+                f"container staging has {len(container_manifest)} (hash-verified: {include_hash})"
             )
 
         self._staging_path = staging_path
@@ -144,7 +209,8 @@ class HermesWorkspaceTransfer:
         if self._staging_path is None:
             raise HermesTransferError("copy_in() was never called for this transfer instance")
 
-        current_host_manifest = _host_manifest(host_worktree_path)
+        include_hash = self._ensure_hashing_probed()
+        current_host_manifest = _host_manifest(host_worktree_path, include_hash=include_hash)
         if current_host_manifest != self._host_manifest_at_copy_in:
             # The host Worktree changed since copy_in() -- never
             # overwrite it with stale container content. Staging is
@@ -154,7 +220,9 @@ class HermesWorkspaceTransfer:
                 "(would overwrite newer host content with stale staging data)"
             )
 
-        container_manifest = _container_manifest(self._docker_bin, self._container, self._staging_path)
+        container_manifest = _container_manifest(
+            self._docker_bin, self._container, self._staging_path, include_hash=include_hash
+        )
         copy = subprocess.run(
             [self._docker_bin, "cp", f"{self._container}:{self._staging_path}/.", host_worktree_path],
             env=_env(), capture_output=True, text=True, timeout=_TIMEOUT_SECONDS,
@@ -163,12 +231,12 @@ class HermesWorkspaceTransfer:
             # Staging left in place -- it may be the only remaining copy.
             raise HermesTransferError(f"docker cp (copy-out) failed: {copy.stderr.strip()}")
 
-        host_manifest_after = _host_manifest(host_worktree_path)
+        host_manifest_after = _host_manifest(host_worktree_path, include_hash=include_hash)
         if host_manifest_after != container_manifest:
             # Incomplete -- do NOT clean up staging; it is the recovery path.
             raise HermesTransferError(
-                "copy-out incomplete: host and container manifests differ after "
-                "copy; staging directory preserved for recovery, not cleaned up"
+                "copy-out incomplete or corrupted: host and container manifests differ "
+                "after copy; staging directory preserved for recovery, not cleaned up"
             )
 
         # Verified complete -- only now may the staging directory be removed.
