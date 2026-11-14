@@ -17,6 +17,12 @@ import enum
 from datetime import datetime, timezone
 
 from universal_orchestrator.core import lifecycle
+from universal_orchestrator.core.dependency_graph import (
+    BlockedDiagnosis,
+    diagnose_blocked,
+    find_cycles,
+    would_create_cycle,
+)
 from universal_orchestrator.core.models import (
     RoutingDecision,
     Task,
@@ -25,7 +31,12 @@ from universal_orchestrator.core.models import (
     TaskStatus,
 )
 from universal_orchestrator.core.state import StateManager
-from universal_orchestrator.errors import NotFoundError, OrchestratorError, QualityGateRequiredError
+from universal_orchestrator.errors import (
+    DependencyCycleError,
+    NotFoundError,
+    OrchestratorError,
+    QualityGateRequiredError,
+)
 from universal_orchestrator.execution.adapter import ExecutionResult
 from universal_orchestrator.execution.quality import QualityVerdict
 
@@ -63,6 +74,15 @@ class TaskManager:
 
     def list_children(self, parent_id: str) -> list[Task]:
         return [t for t in self._tasks.values() if t.parent_id == parent_id]
+
+    def all_tasks(self) -> list[Task]:
+        """Every task currently in the in-memory cache — the same
+        structure `detect_cycles`/`diagnose_blocked` and Milestone 7's
+        Scheduler and Stall Detector read against. Never a DB round
+        trip: the cache, rebuilt from the store on `recover()`, is
+        this process's source of truth, exactly as the rest of this
+        class already treats it."""
+        return list(self._tasks.values())
 
     def record_routing_decision(self, decision: RoutingDecision) -> None:
         """The only path a `RoutingDecision` reaches storage through —
@@ -153,9 +173,29 @@ class TaskManager:
             )
 
         if depends_on_id not in task.depends_on:
+            cycle = would_create_cycle(self._tasks, task_id, depends_on_id)
+            if cycle is not None:
+                raise DependencyCycleError(task_id, depends_on_id, cycle)
             task.depends_on = (*task.depends_on, depends_on_id)
             self._persist(task)
         return task
+
+    # -- cycle & deadlock diagnostics (Milestone 7, Component A) ----------
+
+    def detect_cycles(self) -> list[tuple[str, ...]]:
+        """Defense-in-depth full-graph scan — `add_dependency` already
+        refuses to create a cycle, so this should always return `[]`
+        for a graph built exclusively through that API."""
+        return find_cycles(self._tasks)
+
+    def diagnose_blocked(self, task_id: str) -> BlockedDiagnosis:
+        """Actionable detail for one BLOCKED task: which dependencies
+        are holding it back and whether any of them form a cycle. Does
+        not require `task_id` to currently be BLOCKED — it reports
+        whatever `depends_on` says is unmet right now regardless of
+        status, so it is also safe to call speculatively."""
+        self._require(task_id)
+        return diagnose_blocked(self._tasks, task_id)
 
     # -- analysis / planning -----------------------------------------------
 

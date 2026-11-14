@@ -83,6 +83,22 @@ class QualityGateRequiredError(OrchestratorError):
         )
 
 
+class DependencyCycleError(OrchestratorError):
+    """Raised by `TaskManager.add_dependency` (Milestone 7, Cycle &
+    Deadlock Detector) when adding the requested edge would close a
+    dependency cycle — never persisted; the edge is rejected outright
+    rather than added and later discovered deadlocked."""
+
+    def __init__(self, task_id: str, depends_on_id: str, cycle: tuple[str, ...]) -> None:
+        self.task_id = task_id
+        self.depends_on_id = depends_on_id
+        self.cycle = cycle
+        super().__init__(
+            f"cannot make '{task_id}' depend on '{depends_on_id}': would close "
+            f"a dependency cycle ({' -> '.join(cycle)})"
+        )
+
+
 class InvalidStateTransitionError(OrchestratorError):
     def __init__(self, entity: str, current: str, target: str) -> None:
         self.entity = entity
