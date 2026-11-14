@@ -28,7 +28,7 @@ from universal_orchestrator.core.models import (
     TaskSpecification,
     TaskStatus,
 )
-from universal_orchestrator.errors import DuplicateError, NotFoundError
+from universal_orchestrator.errors import DuplicateError, NotFoundError, SchemaVersionError
 from universal_orchestrator.execution.adapter import (
     ExecutionOutcome,
     ExecutionResult,
@@ -51,7 +51,18 @@ from universal_orchestrator.execution.scheduler import (
 )
 from universal_orchestrator.execution.worktree import WorktreeHandle, WorktreeStatus
 
+# Audit Finding C-8: bumped only when a real, migration-worthy schema
+# change ships. Every database ever produced by this codebase so far
+# (M1 through M7) has this exact table shape, so version 1 covers all
+# of them -- there is nothing to migrate yet, only a guard against a
+# future mismatch being silently ignored.
+CURRENT_SCHEMA_VERSION = 1
+
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS schema_meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    version INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS tasks (
     task_id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
@@ -332,6 +343,20 @@ class StateManager:
                 "INSERT OR IGNORE INTO scheduler_lease (id, holder_id, epoch, acquired_at, "
                 "renewed_at, expires_at) VALUES (1, NULL, 0, NULL, NULL, NULL)"
             )
+            # Audit Finding C-8: a database from before this table
+            # existed has no row yet -- every such database has the
+            # exact version-1 shape (nothing has ever changed it), so
+            # backfilling version 1 here is correct for both a brand
+            # new database and an upgraded-in-place older one. Only a
+            # *mismatched* existing row (a real future migration) is
+            # ever refused.
+            self._conn.execute(
+                "INSERT OR IGNORE INTO schema_meta (id, version) VALUES (1, ?)",
+                (CURRENT_SCHEMA_VERSION,),
+            )
+            row = self._conn.execute("SELECT version FROM schema_meta WHERE id = 1").fetchone()
+            if row["version"] != CURRENT_SCHEMA_VERSION:
+                raise SchemaVersionError(row["version"], CURRENT_SCHEMA_VERSION)
 
     def close(self) -> None:
         self._conn.close()

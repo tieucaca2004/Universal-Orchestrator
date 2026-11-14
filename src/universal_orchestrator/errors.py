@@ -107,3 +107,21 @@ class InvalidStateTransitionError(OrchestratorError):
         super().__init__(
             f"{entity}: cannot transition from '{current}' to '{target}'"
         )
+
+
+class SchemaVersionError(OrchestratorError):
+    """Audit Finding C-8: raised by `StateManager._initialize()` when
+    the database's own recorded `schema_meta.version` does not match
+    this code's `CURRENT_SCHEMA_VERSION` — a mismatch means an actual
+    migration is required before this process touches the database
+    any further. Never silently proceeds, never recreates the
+    database to "fix" this."""
+
+    def __init__(self, db_version: int, code_version: int) -> None:
+        self.db_version = db_version
+        self.code_version = code_version
+        super().__init__(
+            f"database schema is at version {db_version}, this code expects "
+            f"version {code_version} — a migration is required; refusing to "
+            "open this database rather than risk silent corruption"
+        )

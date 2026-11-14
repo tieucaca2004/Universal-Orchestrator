@@ -339,6 +339,64 @@ class ExecutionResultPersistenceTests(StateManagerTestCase):
         self.assertEqual(loaded[0].stdout, "first")
 
 
+class SchemaVersionTests(unittest.TestCase):
+    """Audit Finding C-8 regression tests."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmpdir.name) / "orchestrator.sqlite3"
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_fresh_database_is_stamped_with_the_current_version(self):
+        from universal_orchestrator.core.state import CURRENT_SCHEMA_VERSION
+
+        state = StateManager(self.db_path)
+        try:
+            row = state._conn.execute("SELECT version FROM schema_meta WHERE id = 1").fetchone()
+            self.assertEqual(row["version"], CURRENT_SCHEMA_VERSION)
+        finally:
+            state.close()
+
+    def test_reopening_an_existing_current_version_database_succeeds(self):
+        state = StateManager(self.db_path)
+        task = Task(title="t", project_id="p")
+        state.create(task)
+        state.close()
+
+        state2 = StateManager(self.db_path)
+        try:
+            self.assertIsNotNone(state2.get(task.task_id))
+        finally:
+            state2.close()
+
+    def test_mismatched_version_refuses_to_open_without_touching_data(self):
+        from universal_orchestrator.errors import SchemaVersionError
+
+        state = StateManager(self.db_path)
+        task = Task(title="t", project_id="p")
+        state.create(task)
+        state._conn.execute("UPDATE schema_meta SET version = 999 WHERE id = 1")
+        state.close()
+
+        with self.assertRaises(SchemaVersionError):
+            StateManager(self.db_path)
+
+        # The database file itself must be untouched -- not deleted,
+        # not reset, not silently "fixed".
+        recovery_conn = sqlite3.connect(str(self.db_path))
+        try:
+            row = recovery_conn.execute(
+                "SELECT title FROM tasks WHERE task_id = ?", (task.task_id,)
+            ).fetchone()
+            self.assertEqual(row[0], "t")
+            version_row = recovery_conn.execute("SELECT version FROM schema_meta WHERE id = 1").fetchone()
+            self.assertEqual(version_row[0], 999)
+        finally:
+            recovery_conn.close()
+
+
 class FilePermissionsTests(unittest.TestCase):
     """Audit Finding C-9 regression test: the db directory/file
     previously inherited whatever the process umask produced."""
