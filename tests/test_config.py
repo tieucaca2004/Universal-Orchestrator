@@ -86,5 +86,23 @@ class ConfigFileTests(SettingsTestCase):
         self.assertEqual(settings.log_level, "WARNING")
 
 
+class DataDirPermissionsTests(SettingsTestCase):
+    """Audit Finding C-9 regression test: data_dir/log_dir previously
+    inherited whatever the process umask produced -- commonly
+    world/group-readable -- even though they hold task content,
+    Agent stdout/stderr, and execution evidence."""
+
+    def test_data_dir_and_log_dir_are_created_owner_only(self):
+        import stat
+
+        os.environ["UO_DATA_DIR"] = str(self.tmp_path / "state")
+        os.environ["UO_LOG_DIR"] = str(self.tmp_path / "logs")
+
+        settings = load_settings()
+
+        self.assertEqual(stat.S_IMODE(settings.data_dir.stat().st_mode), stat.S_IRWXU)
+        self.assertEqual(stat.S_IMODE(settings.log_dir.stat().st_mode), stat.S_IRWXU)
+
+
 if __name__ == "__main__":
     unittest.main()

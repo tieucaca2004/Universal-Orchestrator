@@ -11,7 +11,9 @@ silently overwriting it.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import stat
 import threading
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -282,6 +284,10 @@ class StateManager:
     def __init__(self, db_path: Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Audit Finding C-9: task descriptions, Agent stdout/stderr,
+        # and execution evidence all live in this one file -- owner-
+        # only, regardless of umask, before any connection is opened.
+        os.chmod(self.db_path.parent, stat.S_IRWXU)
         # check_same_thread=False (Milestone 6.2): the integration lock
         # must be provably atomic under real concurrent callers, not just
         # sequential calls, so this connection needs to be usable from
@@ -291,6 +297,8 @@ class StateManager:
         self._conn = sqlite3.connect(
             str(self.db_path), isolation_level=None, check_same_thread=False
         )
+        if self.db_path.exists():
+            os.chmod(self.db_path, stat.S_IRUSR | stat.S_IWUSR)
         # `check_same_thread=False` only lifts Python's own thread-affinity
         # check — it does not make concurrent `execute()` calls from two
         # threads on one connection safe by itself (discovered by a real,

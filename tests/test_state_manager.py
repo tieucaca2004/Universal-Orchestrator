@@ -339,5 +339,28 @@ class ExecutionResultPersistenceTests(StateManagerTestCase):
         self.assertEqual(loaded[0].stdout, "first")
 
 
+class FilePermissionsTests(unittest.TestCase):
+    """Audit Finding C-9 regression test: the db directory/file
+    previously inherited whatever the process umask produced."""
+
+    def test_db_directory_and_file_are_created_owner_only(self):
+        import os
+        import stat
+
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            db_path = Path(tmp.name) / "nested" / "orchestrator.sqlite3"
+            state = StateManager(db_path)
+            try:
+                self.assertEqual(stat.S_IMODE(db_path.parent.stat().st_mode), stat.S_IRWXU)
+                self.assertEqual(
+                    stat.S_IMODE(db_path.stat().st_mode), stat.S_IRUSR | stat.S_IWUSR
+                )
+            finally:
+                state.close()
+        finally:
+            tmp.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()

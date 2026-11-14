@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,12 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
 
     data_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
+    # Audit Finding C-9: these hold task content, Agent stdout/stderr,
+    # and real execution evidence -- restrict to the owner only,
+    # regardless of umask. A single-user service has no reason for
+    # anyone else on the host to read this.
+    os.chmod(data_dir, stat.S_IRWXU)
+    os.chmod(log_dir, stat.S_IRWXU)
 
     return Settings(
         repo_root=root,
