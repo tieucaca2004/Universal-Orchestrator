@@ -1,8 +1,21 @@
-"""Task Planner interface.
+"""Task Planner interface — superseded, never implemented.
 
-A planner turns a submitted `Task` into an ordered set of steps an agent
-can act on. Concrete planners (rule-based, provider-delegated, ...) land
-once the orchestration engine (Milestone 2) can drive them.
+A planner turns a submitted `Task` into an ordered set of steps an
+agent can act on. This docstring originally said a concrete planner
+would land once the orchestration engine (Milestone 2) could drive
+it — the engine now exists, and real task decomposition instead went
+through `analysis.analyzer.TaskAnalyzer` (Milestone 2) and
+`core.task_manager.TaskManager.decompose()`, never through this
+interface. The `role="planner"` references elsewhere in ROADMAP.md
+describe an Agent *role string*, not this class.
+
+Audit Finding C-11/16-B (2026-11-14): confirmed, across all of M1-M7,
+that no concrete subclass of `TaskPlanner` exists anywhere in this
+codebase or its tests — the only reference anywhere is
+`tests/test_interfaces.py`'s check that this ABC cannot be
+instantiated directly. Kept rather than deleted so this superseded
+interface stays visible rather than silently disappearing; not on
+any real execution path.
 """
 
 from __future__ import annotations
