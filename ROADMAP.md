@@ -705,6 +705,65 @@ unchanged until the Founder explicitly decides to approve the scope
 as built, require changes to it, or reject/roll it back. No date or
 signature of approval is recorded here because none occurred.
 
+**Remediation closure update (2026-11-14, same day, later session).**
+In this session, the Founder explicitly authorized M7's existing
+implementation and directed a full remediation pass against the
+audit's C1–C13 findings plus the code-quality items in its §16. This
+is recorded here exactly as it happened — authorization was given
+*after* the code already existed and *during* its remediation, not
+via a prior architecture review that this document could point back
+to. No earlier meeting, review, or sign-off is invented to fill that
+gap. What this authorization covers and does not cover:
+
+- **Covers:** M7's code existing, being remediated, and being kept
+  in the repository going forward, in the shape produced by this
+  remediation pass.
+- **Does not cover:** a formal, itemized architecture review of M7's
+  scope against alternatives — that step, which §11's original text
+  above calls for, still has not occurred and is not asserted to have
+  occurred.
+
+Remediation results (commits `958f72a`..`b7c3725`, 16 commits total
+across both sessions, branch `main`, pushed to `origin/main`):
+all 13 lettered findings (C1–C13) and the §16 code-quality items were
+closed, deferred, or explicitly left open with a stated reason — see
+each commit message for the specific finding it addresses. Full
+regression suite: **479/479 passing**, run fresh after every commit
+in this sequence (`PYTHONPATH=src python3 -m unittest discover -s
+tests`). **Real Agent verification was NOT RUN during this
+remediation** — every new and existing test uses a deterministic
+fake executable/container, never a real `claude` CLI or Hermes call;
+this must not be read as evidence the Scheduler works against a real
+provider, only that it works against the fakes.
+
+Two items remain explicitly open, not silently dropped:
+- **C-6** (worker shutdown lifecycle): materially improved — shutdown
+  now makes a real, targeted attempt to cancel a stuck worker's
+  underlying Agent subprocess via each adapter's own existing
+  `cancel()`, and only releases the scheduler lease once the active
+  worker count is actually back to zero. The one limitation that
+  cannot be eliminated, by design of the Python runtime, not a gap in
+  this code: a worker *thread* itself cannot be force-terminated if,
+  for some reason other than its subprocess, it never unblocks. The
+  system fails safe in that case — exactly as it did before this
+  session, the lease is simply never released, and a future takeover
+  quarantines it.
+- **C-7** (historical git exposure): classified precisely this
+  session. The real LAN IP `192.168.100.209`, hostname `tieu`, the
+  Linux username `phongtieu`, and two unrelated local project names
+  were introduced in exactly one commit, `f88ef81` (Milestone 1, the
+  repository's very first commit), and removed from the working tree
+  in the very next commit touching those files, `dcfaccb`. A fresh
+  scan of the complete history this session (`git log --all -p`) for
+  credential/API-key/private-key patterns found **no actual
+  credential, token, or private key anywhere in this repository's
+  history** — only the non-secret metadata above. It remains
+  recoverable via `git log --all`/`git show f88ef81` because Git
+  history is immutable without a rewrite, which was explicitly not
+  performed this session (no `git filter-repo`, no force-push, no
+  history rewrite of any kind) and requires a separate Founder
+  decision to authorize.
+
 ## 12. M8 — End-to-End Acceptance — **PLANNED (provisional shape only), NOT APPROVED, NOT IMPLEMENTED**
 
 - **Objective:** final validation that the full M1–M6 pipeline (and

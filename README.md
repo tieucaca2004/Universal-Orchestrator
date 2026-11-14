@@ -14,12 +14,17 @@ Milestone 6 (Git Worktree Manager, Conflict Manager, Approval Gate,
 Quality Gate) is **IMPLEMENTED, TESTED, VERIFIED, COMPLETE / ACCEPTED
 / CLOSED**. Milestone 7 (Cycle & Deadlock Detector, scheduler lease
 fencing, State-aware Stall Detector, Task Scheduler, Proposal Recovery
-CLI) **exists in code but has no recorded Founder approval** — see
-ROADMAP.md §11. A full M1–M7 audit and remediation pass (2026-11-14)
-fixed several confirmed defects found in M7 and earlier milestones;
-see the repository's commit history for the itemized findings and
-fixes. This note corrects a previously stale claim here that the
-project was still at Milestone 5 (audit Finding C-11). See
+CLI) is **IMPLEMENTED, TESTED (479/479, fake-executable-backed —
+real Agent execution NOT RUN), and Founder-authorized**, but has
+**not** been through a documented architecture-scope review — see
+ROADMAP.md §11 for the exact distinction. A full M1–M7 audit and two
+remediation passes (2026-11-14) fixed every confirmed defect found,
+or left it explicitly open with a stated reason (notably C-7, a
+historical, non-credential data-exposure item pending a separate
+Founder decision on a Git history rewrite); see the repository's
+commit history for the itemized findings and fixes. This note
+corrects a previously stale claim here that the project was still at
+Milestone 5 (audit Finding C-11). See
 [ROADMAP.md](ROADMAP.md) for the authoritative milestone status,
 M8 plans, and the Orchestrator A / Orchestrator B distinction;
 [ARCHITECTURE.md](ARCHITECTURE.md) for the component map and the
