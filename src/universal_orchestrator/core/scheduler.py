@@ -140,6 +140,17 @@ class Scheduler:
         self._executor: ThreadPoolExecutor | None = None
         self._futures: dict[str, Future] = {}
         self._futures_lock = Lock()
+        # Audit Finding C-6: (provider_id, execution_id) for every
+        # task currently blocked inside adapter.execute(), recorded
+        # the moment it's known (engine.execute()'s on_dispatched
+        # hook) -- the only way shutdown() can attempt a real,
+        # targeted subprocess termination for a worker stuck past
+        # drain_timeout_seconds. This does not and cannot kill the
+        # Python *thread* itself; it kills the subprocess that thread
+        # is blocked on, which is the actual resource that matters --
+        # see `shutdown()`'s own docstring for why the lease is never
+        # released based on this alone.
+        self._inflight: dict[str, tuple[str, str]] = {}
 
     @property
     def holder_id(self) -> str:
@@ -290,13 +301,38 @@ class Scheduler:
     def shutdown(self) -> None:
         """Stop accepting new work, wait up to `drain_timeout_seconds`
         for in-flight workers, and release the lease *only if* every
-        one of them actually finished. Never force-kills a worker
-        thread or the Agent subprocess underneath it — neither
-        adapter's lifecycle supports that safely — and never releases
-        while completion is unconfirmed: a straggler left running
-        keeps the lease it still (genuinely) holds, so a future
-        takeover's own recovery scan is what eventually quarantines
-        it, never a premature reuse of its Worktree."""
+        one of them actually finished.
+
+        Audit Finding C-6: a Python worker *thread* cannot be safely
+        force-terminated by this or any code -- that claim is never
+        made here, and `cancel()`ing the `Future` this thread runs
+        under would only prevent a not-yet-started call from starting,
+        never stop one already blocked inside `adapter.execute()`
+        (`concurrent.futures.Future.cancel()`'s own documented
+        behavior). What genuinely *can* be terminated is the real
+        Agent subprocess that thread is blocked on, via each
+        adapter's own existing, targeted `cancel(execution_id)` (real
+        process-group SIGTERM/SIGKILL for Claude; a second, in-
+        container PID-targeted signal for Hermes, never a broad
+        pattern-match kill that could hit an unrelated process sharing
+        that container). For every worker still active once the drain
+        deadline passes, this now makes exactly one best-effort
+        attempt at that -- logged either way, and still never
+        required to succeed.
+
+        This does **not** change the release decision: whether or not
+        the cancel attempt above succeeded, the lease is released
+        *only if* `_active_count()` is actually back to zero by the
+        time this method returns. A cancelled subprocess usually
+        unblocks its worker thread quickly (the thread's own
+        `communicate()`/`wait()` call returns once the process exits),
+        so this often lets a clean release happen where the old code
+        never could -- but if a thread is still blocked for any other
+        reason, the lease is still correctly left unreleased, exactly
+        as before this fix: a straggler left running keeps the lease
+        it still (genuinely) holds, so a future takeover's own
+        recovery scan is what eventually quarantines it, never a
+        premature reuse of its Worktree."""
         self._stop_event.set()
         if self._executor is None:
             return
@@ -305,13 +341,24 @@ class Scheduler:
         while time.monotonic() < deadline and self._active_count() > 0:
             time.sleep(0.05)
 
+        if self._active_count() > 0:
+            self._attempt_cancel_stuck_workers()
+            # A successful subprocess kill unblocks its thread almost
+            # immediately (it is blocked on that subprocess exiting);
+            # give it one short, bounded grace window rather than
+            # declaring it still-active a moment too early.
+            grace_deadline = time.monotonic() + min(5.0, self._settings.drain_timeout_seconds)
+            while time.monotonic() < grace_deadline and self._active_count() > 0:
+                time.sleep(0.05)
+
         still_active = self._active_count()
         self._executor.shutdown(wait=False)
 
         if still_active > 0:
             _LOG.warning(
-                "shutdown: worker(s) still active after drain_timeout_seconds -- "
-                "NOT releasing the lease; it will expire naturally",
+                "shutdown: worker(s) still active after drain_timeout_seconds (and a "
+                "best-effort subprocess cancel attempt) -- NOT releasing the lease; "
+                "it will expire naturally",
                 extra={"fields": {"still_active": still_active, "holder_id": self._holder_id}},
             )
             return
@@ -321,6 +368,32 @@ class Scheduler:
             "scheduler shutdown complete",
             extra={"fields": {"holder_id": self._holder_id, "lease_released": released}},
         )
+
+    def _attempt_cancel_stuck_workers(self) -> None:
+        with self._futures_lock:
+            stuck = {task_id: self._inflight[task_id] for task_id in self._futures if task_id in self._inflight}
+        for task_id, (provider_id, execution_id) in stuck.items():
+            try:
+                adapter = self._engine.adapters.get(provider_id) if self._engine.adapters else None
+                cancel = getattr(adapter, "cancel", None)
+                if cancel is None:
+                    _LOG.warning(
+                        "shutdown: adapter has no cancel() -- cannot terminate this worker's subprocess",
+                        extra={"fields": {"task_id": task_id, "provider_id": provider_id}},
+                    )
+                    continue
+                cancelled = cancel(execution_id)
+                _LOG.warning(
+                    "shutdown: attempted subprocess cancellation for a worker stuck past drain_timeout_seconds",
+                    extra={"fields": {
+                        "task_id": task_id, "execution_id": execution_id, "cancel_accepted": cancelled,
+                    }},
+                )
+            except Exception:
+                _LOG.exception(
+                    "shutdown: cancel attempt itself raised -- worker left as-is, lease still not released",
+                    extra={"fields": {"task_id": task_id}},
+                )
 
     # -- internals -----------------------------------------------------------
 
@@ -351,6 +424,14 @@ class Scheduler:
         with self._futures_lock:
             self._futures.pop(task_id, None)
 
+    def _record_inflight(self, task_id: str, request) -> None:
+        with self._futures_lock:
+            self._inflight[task_id] = (request.provider_id, request.execution_id)
+
+    def _forget_inflight(self, task_id: str) -> None:
+        with self._futures_lock:
+            self._inflight.pop(task_id, None)
+
     def _run_task(self, task_id: str) -> None:
         task = self._engine.manager.get(task_id)
         try:
@@ -370,11 +451,14 @@ class Scheduler:
                 task_id, project,
                 input_context=input_context, workspace_transfer=self._workspace_transfer,
                 timeout_seconds=self._settings.dispatch_timeout_seconds,
+                on_dispatched=lambda request: self._record_inflight(task_id, request),
             )
         except Exception:
             _LOG.exception("dispatch failed", extra={"fields": {"task_id": task_id}})
             self._finish_claim(task_id)
             return
+        finally:
+            self._forget_inflight(task_id)
 
         if not self._still_authoritative():
             _LOG.warning(

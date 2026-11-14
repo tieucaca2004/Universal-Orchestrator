@@ -33,6 +33,7 @@ being force-interrupted by a *different* process's bootstrap; see
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 from universal_orchestrator.analysis.analyzer import TaskAnalyzer
 from universal_orchestrator.core.models import (
@@ -166,6 +167,7 @@ class OrchestrationEngine:
         input_context: str = "",
         timeout_seconds: float = 60.0,
         policy: ExecutionPolicy | None = None,
+        on_dispatched: Callable[[ExecutionRequest], None] | None = None,
     ) -> ExecutionResult:
         """Task Manager -> Agent Router's last decision -> revalidation
         -> Execution Adapter -> Task Manager. Refuses to run without a
@@ -178,7 +180,20 @@ class OrchestrationEngine:
         1. the selected agent is still `AgentStatus.AVAILABLE`,
         2. the selected provider is still verified and `AVAILABLE`,
         3. the adapter's own `verify()` returns `AVAILABLE` right now.
-        Any failure raises a typed error and dispatches nothing."""
+        Any failure raises a typed error and dispatches nothing.
+
+        Audit Finding C-6: `on_dispatched`, if supplied, is called
+        once with the real `ExecutionRequest` (so its `execution_id`
+        and `provider_id` are known) right before `adapter.execute()`
+        is invoked — the only point this process has to learn which
+        adapter instance and which in-flight `execution_id` a worker
+        is blocked on, before that call returns. Exists so a caller
+        like `core.scheduler.Scheduler` can attempt a real, targeted
+        `adapter.cancel(execution_id)` against a worker stuck past its
+        drain timeout. Never called for a dispatch that never reaches
+        the adapter call (every revalidation check above still runs
+        and can still raise first); optional and additive — omitting
+        it changes nothing about `execute()`'s own behavior."""
         if self.adapters is None:
             raise RuntimeError("OrchestrationEngine has no adapter registry configured")
         if self.agents is None:
@@ -225,6 +240,8 @@ class OrchestrationEngine:
             timeout_seconds=timeout_seconds,
             correlation_id=latest.decision_id,
         )
+        if on_dispatched is not None:
+            on_dispatched(request)
         result = adapter.execute(request)
         self.manager.record_execution_result(result)
         return result

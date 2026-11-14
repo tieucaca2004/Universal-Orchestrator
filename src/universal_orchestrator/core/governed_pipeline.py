@@ -34,11 +34,12 @@ from __future__ import annotations
 import os
 import subprocess
 from dataclasses import dataclass
+from typing import Callable
 
 from universal_orchestrator.core.engine import OrchestrationEngine
 from universal_orchestrator.core.models import ProjectProfile, TaskError, TaskStatus
 from universal_orchestrator.errors import OrchestratorError
-from universal_orchestrator.execution.adapter import ExecutionPolicy, ExecutionResult
+from universal_orchestrator.execution.adapter import ExecutionPolicy, ExecutionRequest, ExecutionResult
 from universal_orchestrator.execution.approval import IntegrationProposal
 from universal_orchestrator.execution.approval_manager import ApprovalGate
 from universal_orchestrator.execution.conflict_manager import ConflictManager
@@ -85,6 +86,7 @@ class GovernedPipeline:
         timeout_seconds: float = 60.0,
         policy: ExecutionPolicy | None = None,
         workspace_transfer: HermesWorkspaceTransfer | None = None,
+        on_dispatched: Callable[[ExecutionRequest], None] | None = None,
     ) -> ExecutionResult:
         """Steps 1-4 of the Founder-specified sequence only: acquire a
         dedicated Worktree, dispatch the real Agent into it, and commit
@@ -134,6 +136,7 @@ class GovernedPipeline:
                 input_context=input_context,
                 timeout_seconds=timeout_seconds,
                 policy=policy,
+                on_dispatched=on_dispatched,
             )
         except Exception:
             # Dispatch itself failed (adapter unavailable, stale routing

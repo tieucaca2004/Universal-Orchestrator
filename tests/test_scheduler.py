@@ -80,6 +80,7 @@ class BlockingAdapter(ExecutionAdapter):
         self.calls: list[str] = []
         self.input_contexts: dict[str, str] = {}
         self.timeout_seconds: dict[str, float] = {}
+        self.execution_ids: dict[str, str] = {}
 
     def verify(self) -> VerificationStatus:
         return VerificationStatus.AVAILABLE
@@ -91,17 +92,38 @@ class BlockingAdapter(ExecutionAdapter):
             self.calls.append(request.task_id)
             self.input_contexts[request.task_id] = request.input_context
             self.timeout_seconds[request.task_id] = request.timeout_seconds
+            self.execution_ids[request.task_id] = request.execution_id
         self.started.set()
         self.release.wait(timeout=10)
         Path(request.working_directory, "agent_output.txt").write_text("fake output\n")
         with self._lock:
             self.active -= 1
         return ExecutionResult(
-            execution_id=f"exec_{request.task_id}",
+            execution_id=request.execution_id,
             task_id=request.task_id,
             outcome=ExecutionOutcome.COMPLETED,
             exit_code=0,
         )
+
+
+class CancellableBlockingAdapter(BlockingAdapter):
+    """Audit Finding C-6: unlike the base `BlockingAdapter` (which
+    deliberately has no `cancel()` at all, exercising the "adapter
+    has no cancel()" fallback every other test in this file already
+    relies on), this mimics a real adapter's targeted subprocess
+    kill -- `cancel(execution_id)` unblocks exactly the worker blocked
+    on that id, real completion follows normally afterward, exactly
+    as a real killed subprocess's `communicate()` call would return
+    once the process actually exits."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancelled_execution_ids: list[str] = []
+
+    def cancel(self, execution_id: str) -> bool:
+        self.cancelled_execution_ids.append(execution_id)
+        self.release.set()
+        return True
 
 
 def _build_stack(state: StateManager, adapter: ExecutionAdapter):
@@ -393,6 +415,62 @@ class ShutdownDrainTests(SchedulerTestCase):
 
         scheduler.shutdown()
         self.assertIsNone(leases.current().holder_id)
+
+
+class ShutdownSubprocessCancellationTests(SchedulerTestCase):
+    """Audit Finding C-6 regression tests: `shutdown()` now makes a
+    real, targeted attempt to cancel a stuck worker's underlying
+    subprocess (never claiming to kill the Python thread itself).
+    `BlockingAdapter`'s own cancel-less default already proves the
+    pre-existing "never force-kill, never release" path is unchanged
+    (`ShutdownDrainTests` above) -- these specifically add the new
+    cancellable-adapter path, which did not exist before this fix."""
+
+    def test_shutdown_cancels_the_real_subprocess_and_then_safely_releases(self):
+        cancellable_adapter = CancellableBlockingAdapter()
+        engine, pipeline = _build_stack(self.state, cancellable_adapter)
+        task_id = engine.submit(TaskRequest(title="t"), self.project).task_id
+
+        scheduler = Scheduler(
+            self.state, engine, pipeline, self.projects,
+            settings=SchedulerSettings(max_concurrency=1, lease_seconds=30, poll_seconds=0.02,
+                                        drain_timeout_seconds=0.2),
+        )
+        scheduler.start()
+        scheduler.run_once()
+        self.assertTrue(cancellable_adapter.started.wait(timeout=2))  # worker now genuinely blocked
+
+        scheduler.shutdown()  # drain_timeout_seconds=0.2 expires -> must attempt a real cancel
+
+        expected_execution_id = cancellable_adapter.execution_ids[task_id]
+        self.assertEqual(cancellable_adapter.cancelled_execution_ids, [expected_execution_id])
+
+        leases = SchedulerLeaseManager(self.state)
+        # The cancelled subprocess unblocked the worker quickly enough
+        # for shutdown's own bounded grace window to see it finish,
+        # so the lease -- unlike the no-cancel-support case above --
+        # is safely released, never prematurely.
+        self.assertIsNone(leases.current().holder_id)
+        self.assertEqual(leases.get_claim(task_id).status, ClaimStatus.COMPLETED)
+
+    def test_shutdown_never_calls_cancel_for_a_task_that_already_finished(self):
+        """Audit Finding C-6, requirement 8 (never touch an unrelated
+        or already-settled worker): only a task still in `_futures`
+        when the drain deadline passes is a cancellation candidate."""
+        cancellable_adapter = CancellableBlockingAdapter()
+        engine, pipeline = _build_stack(self.state, cancellable_adapter)
+        task_id = engine.submit(TaskRequest(title="t"), self.project).task_id
+        cancellable_adapter.release.set()  # never blocks for this test
+
+        scheduler = Scheduler(self.state, engine, pipeline, self.projects, settings=self.settings)
+        scheduler.start()
+        scheduler.run_once()
+
+        leases = SchedulerLeaseManager(self.state)
+        self.assertTrue(_wait_until(lambda: leases.get_claim(task_id).status == ClaimStatus.COMPLETED))
+
+        scheduler.shutdown()
+        self.assertEqual(cancellable_adapter.cancelled_execution_ids, [])
 
 
 class InputContextTests(SchedulerTestCase):
