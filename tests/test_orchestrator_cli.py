@@ -18,7 +18,16 @@ import textwrap
 import unittest
 from pathlib import Path
 
+from universal_orchestrator.cli.orchestrator_cli import (
+    PathTraversalError,
+    _safe_worktree_target,
+    _write_agent_file,
+    cmd_extract_claude_files,
+)
+from universal_orchestrator.core.engine import OrchestrationEngine
+from universal_orchestrator.core.models import ProjectProfile, TaskRequest
 from universal_orchestrator.core.state import StateManager
+from universal_orchestrator.execution.adapter import ExecutionOutcome, ExecutionResult
 
 _FAKE_CLAUDE = textwrap.dedent(
     """\
@@ -276,6 +285,158 @@ class RealEntrypointBypassPreventionTest(OrchestratorEntrypointTestCase):
             self.assertEqual(state.get(task_id).status.value, "failed")
         finally:
             state.close()
+
+
+class SafeWorktreeTargetTests(unittest.TestCase):
+    """Audit Finding C-2 regression tests: `extract-claude-files`
+    writes an Agent's own, untrusted text reply into real files. Every
+    case here would have written outside `self.root` under the
+    pre-fix code, which did `worktree_path / relative_name` with no
+    validation at all."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.base = Path(self._tmpdir.name)
+        self.root = self.base / "worktree"
+        self.root.mkdir()
+        self.outside = self.base / "outside"
+        self.outside.mkdir()
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_simple_traversal_is_rejected(self):
+        with self.assertRaises(PathTraversalError):
+            _safe_worktree_target(self.root, "../outside.txt")
+
+    def test_nested_traversal_is_rejected(self):
+        with self.assertRaises(PathTraversalError):
+            _safe_worktree_target(self.root, "a/../../outside.txt")
+
+    def test_absolute_path_is_rejected(self):
+        with self.assertRaises(PathTraversalError):
+            _safe_worktree_target(self.root, str(self.outside / "x.txt"))
+
+    def test_windows_style_traversal_is_rejected(self):
+        with self.assertRaises(PathTraversalError):
+            _safe_worktree_target(self.root, "..\\..\\outside.txt")
+
+    def test_empty_or_whitespace_name_is_rejected(self):
+        with self.assertRaises(PathTraversalError):
+            _safe_worktree_target(self.root, "   ")
+
+    def test_leading_dot_slash_is_harmless_and_normalized(self):
+        # pathlib itself drops a leading "./" -- this never reaches
+        # the traversal check at all and lands safely inside root,
+        # exactly like a bare "x.txt" would.
+        target = _safe_worktree_target(self.root, "./x.txt")
+        self.assertEqual(target, self.root.resolve() / "x.txt")
+
+    def test_encoded_traversal_is_treated_as_a_literal_harmless_name(self):
+        # No percent-decoding happens anywhere in this pipeline, so an
+        # encoded traversal attempt is just an odd file name, still
+        # strictly inside the Worktree -- never a bypass.
+        target = _safe_worktree_target(self.root, "%2e%2e%2foutside.txt")
+        self.assertEqual(target.parent, self.root.resolve())
+
+    def test_valid_nested_file_is_allowed(self):
+        target = _safe_worktree_target(self.root, "src/pkg/module.py")
+        self.assertEqual(target, self.root.resolve() / "src" / "pkg" / "module.py")
+
+    def test_symlinked_directory_pointing_outside_is_rejected(self):
+        (self.root / "escape").symlink_to(self.outside, target_is_directory=True)
+        with self.assertRaises(PathTraversalError):
+            _safe_worktree_target(self.root, "escape/x.txt")
+
+    def test_chained_symlinks_pointing_outside_is_rejected(self):
+        far = self.base / "far"
+        far.mkdir()
+        (self.outside / "hop2").symlink_to(far, target_is_directory=True)
+        (self.root / "hop1").symlink_to(self.outside, target_is_directory=True)
+        with self.assertRaises(PathTraversalError):
+            _safe_worktree_target(self.root, "hop1/hop2/x.txt")
+
+    def test_preexisting_symlink_pointing_outside_at_the_final_component_is_rejected(self):
+        (self.root / "evil.txt").symlink_to(self.outside / "secret.txt")
+        with self.assertRaises(PathTraversalError):
+            _safe_worktree_target(self.root, "evil.txt")
+
+    def test_write_refuses_to_follow_a_preexisting_symlink_even_if_it_points_inside(self):
+        real_file = self.root / "real.txt"
+        real_file.write_text("original\n")
+        link = self.root / "link.txt"
+        link.symlink_to(real_file)
+        with self.assertRaises(OSError):
+            _write_agent_file(link, "attacker-controlled\n")
+        self.assertEqual(real_file.read_text(), "original\n")
+
+    def test_overwriting_an_existing_regular_file_succeeds(self):
+        target = _safe_worktree_target(self.root, "file.txt")
+        _write_agent_file(target, "v1\n")
+        target_again = _safe_worktree_target(self.root, "file.txt")
+        _write_agent_file(target_again, "v2\n")
+        self.assertEqual(target.read_text(), "v2\n")
+
+    def test_valid_nested_write_creates_intermediate_directories(self):
+        target = _safe_worktree_target(self.root, "a/b/c.txt")
+        _write_agent_file(target, "hello\n")
+        self.assertEqual(target.read_text(), "hello\n")
+
+
+class ExtractClaudeFilesAdversarialTests(unittest.TestCase):
+    """Drives the real `cmd_extract_claude_files` CLI handler
+    in-process against a malicious Agent reply and proves no file is
+    ever created outside the Worktree, and nothing at all is written
+    on rejection (all-or-nothing)."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.base = Path(self._tmpdir.name)
+        self.db_path = self.base / "orchestrator.sqlite3"
+        self.worktree = self.base / "worktree"
+        _init_repo(self.worktree)  # a real git repo: the benign case must `git add`/`commit` for real
+        (self.base / "outside_marker.txt").write_text("should never be touched\n")
+
+        self.state = StateManager(self.db_path)
+        engine = OrchestrationEngine.bootstrap(self.state)
+        self.task = engine.submit(
+            TaskRequest(title="extract test"), ProjectProfile(name="p", repository_path=str(self.worktree))
+        )
+
+    def tearDown(self):
+        self.state.close()
+        self._tmpdir.cleanup()
+
+    def _record_reply(self, reply_text: str) -> None:
+        self.state.save_execution_result(
+            ExecutionResult(
+                execution_id="exec_1", task_id=self.task.task_id,
+                outcome=ExecutionOutcome.COMPLETED, exit_code=0,
+                structured_output={"result": reply_text},
+            )
+        )
+
+    def _args(self):
+        import argparse
+        return argparse.Namespace(
+            db=str(self.db_path), task_id=self.task.task_id, worktree=str(self.worktree)
+        )
+
+    def test_malicious_reply_writes_nothing_outside_and_returns_nonzero(self):
+        self._record_reply(
+            "=== FILE: notes.txt ===\nfine\n"
+            "=== FILE: ../../outside_marker.txt ===\nPWNED\n"
+        )
+        rc = cmd_extract_claude_files(self._args())
+        self.assertEqual(rc, 1)
+        self.assertEqual((self.base / "outside_marker.txt").read_text(), "should never be touched\n")
+        self.assertFalse((self.worktree / "notes.txt").exists())  # all-or-nothing: good block not written either
+
+    def test_benign_reply_writes_exactly_the_declared_files(self):
+        self._record_reply("=== FILE: pkg/mod.py ===\nprint('hi')\n")
+        rc = cmd_extract_claude_files(self._args())
+        self.assertEqual(rc, 0)
+        self.assertEqual((self.worktree / "pkg" / "mod.py").read_text(), "print('hi')\n")
 
 
 if __name__ == "__main__":

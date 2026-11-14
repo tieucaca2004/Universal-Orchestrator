@@ -41,6 +41,7 @@ Worktree, performs the save.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -77,6 +78,62 @@ _ENV_ALLOWLIST = ("HOME", "PATH", "LANG", "LC_ALL", "TERM", "TMPDIR")
 _FILE_BLOCK_RE = re.compile(
     r"=== FILE: (?P<name>[^\s=]+) ===\n(?P<content>.*?)(?=\n=== FILE: |\Z)", re.DOTALL
 )
+
+
+class PathTraversalError(ValueError):
+    """Raised by `_safe_worktree_target` — an Agent-generated
+    '=== FILE: <name> ===' name would write outside its own
+    Worktree (Audit Finding C-2)."""
+
+
+def _safe_worktree_target(worktree_root: Path, relative_name: str) -> Path:
+    """Resolves an Agent-generated file name to a real location
+    strictly inside `worktree_root`, or raises `PathTraversalError`.
+
+    The Agent's own text reply is untrusted input: this rejects an
+    empty name, an absolute path, any literal `.`/`..` component
+    (Windows-style `\\` separators are normalized to `/` first, so a
+    traversal attempt spelled either way is caught identically), and
+    — by resolving the full candidate path and checking containment
+    against the Worktree's own resolved real path — any symlink
+    anywhere along the way, existing or not, that would otherwise
+    redirect the write outside the Worktree. Never decodes percent-
+    encoding or any other escaping scheme, so an encoded traversal
+    attempt (e.g. '%2e%2e') is just a literal, harmless file name,
+    not a bypass."""
+    name = relative_name.strip()
+    if not name:
+        raise PathTraversalError("empty file name")
+
+    candidate = Path(name.replace("\\", "/"))
+    if candidate.is_absolute():
+        raise PathTraversalError(f"absolute path not allowed: {relative_name!r}")
+
+    parts = candidate.parts
+    if not parts or any(part in ("..", ".", "") for part in parts):
+        raise PathTraversalError(f"path traversal not allowed: {relative_name!r}")
+
+    root = worktree_root.resolve(strict=True)
+    target = root.joinpath(*parts)
+    resolved = target.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise PathTraversalError(f"escapes the Worktree: {relative_name!r}")
+    return target
+
+
+def _write_agent_file(target: Path, content: str) -> None:
+    """Writes `content` to `target`, refusing to follow a symlink at
+    the final path component (`O_NOFOLLOW`) — an Agent-controlled
+    name must never cause a write through a symlink planted earlier
+    in the Worktree, whether by a prior extraction or by committed
+    Agent content. `_safe_worktree_target` has already confirmed
+    `target` itself resolves inside the Worktree; this additionally
+    refuses to overwrite a pre-existing symlink even if that symlink
+    happens to point back inside the Worktree."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(content)
 
 
 def _open_state(db_path: str) -> StateManager:
@@ -213,23 +270,36 @@ def cmd_extract_claude_files(args: argparse.Namespace) -> int:
             return 1
 
         worktree_path = Path(args.worktree)
-        written = []
+
+        # Validate every block's destination *before* writing anything --
+        # one bad name must abort the whole extraction, never a partial,
+        # inconsistent write (Audit Finding C-2).
+        planned: list[tuple[str, Path, str]] = []
         for match in matches:
             relative_name = match.group("name").strip()
             content = match.group("content")
-            if content.endswith("\n") is False:
+            if not content.endswith("\n"):
                 content += "\n"
-            target = worktree_path / relative_name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content)
+            try:
+                target = _safe_worktree_target(worktree_path, relative_name)
+            except PathTraversalError as exc:
+                print(f"Refused: real Agent reply named an unsafe file path: {exc}. Zero files written.")
+                return 1
+            planned.append((relative_name, target, content))
+
+        written = []
+        for relative_name, target, content in planned:
+            _write_agent_file(target, content)
             written.append(relative_name)
             print(f"Wrote real Agent-generated content to: {relative_name} ({len(content)} bytes)")
 
-        subprocess.run(["git", "-C", str(worktree_path), "add", "-A"], env=_env(), check=True)
+        subprocess.run(
+            ["git", "-C", str(worktree_path), "add", "-A"], env=_env(), check=True, timeout=30.0
+        )
         subprocess.run(
             ["git", "-C", str(worktree_path), "commit", "-q", "-m",
              f"apply real Agent-generated files for {args.task_id}"],
-            env=_env(), check=True,
+            env=_env(), check=True, timeout=30.0,
         )
         print(f"FILES_WRITTEN={','.join(written)}")
         return 0
