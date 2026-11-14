@@ -39,7 +39,14 @@ from universal_orchestrator.execution.approval import (
 )
 from universal_orchestrator.execution.conflict import ConflictReport
 from universal_orchestrator.execution.quality import QualityReport, QualityVerdict
-from universal_orchestrator.execution.scheduler import ClaimStatus, SchedulerLease, TaskClaim
+from universal_orchestrator.execution.scheduler import (
+    AlertKind,
+    AlertSeverity,
+    ClaimStatus,
+    SchedulerAlert,
+    SchedulerLease,
+    TaskClaim,
+)
 from universal_orchestrator.execution.worktree import WorktreeHandle, WorktreeStatus
 
 _SCHEMA = """
@@ -230,6 +237,25 @@ CREATE TABLE IF NOT EXISTS scheduler_claims (
 );
 CREATE INDEX IF NOT EXISTS idx_scheduler_claims_status ON scheduler_claims(status);
 CREATE INDEX IF NOT EXISTS idx_scheduler_claims_epoch ON scheduler_claims(epoch);
+
+-- Milestone 7 (State-aware Stall Detector, Component B): pure
+-- bookkeeping, never consulted by ApprovalGate/GovernedPipeline and
+-- never itself mutating a task or worktree row — see
+-- `core.stall_detector`'s module docstring.
+CREATE TABLE IF NOT EXISTS scheduler_alerts (
+    alert_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    detected_at TEXT NOT NULL,
+    acknowledged INTEGER NOT NULL DEFAULT 0,
+    acknowledged_at TEXT,
+    acknowledged_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_scheduler_alerts_task_id ON scheduler_alerts(task_id);
+CREATE INDEX IF NOT EXISTS idx_scheduler_alerts_acknowledged ON scheduler_alerts(acknowledged);
+CREATE INDEX IF NOT EXISTS idx_scheduler_alerts_kind ON scheduler_alerts(kind);
 """
 
 _COLUMNS = (
@@ -895,6 +921,80 @@ class StateManager:
             rows = self._conn.execute(query, params).fetchall()
         return [_row_to_task_claim(row) for row in rows]
 
+    # -- scheduler alerts (Milestone 7, Component B) ---------------------------
+
+    def save_scheduler_alert(self, alert: SchedulerAlert) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO scheduler_alerts (
+                    alert_id, task_id, kind, severity, detail, detected_at,
+                    acknowledged, acknowledged_at, acknowledged_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    alert.alert_id,
+                    alert.task_id,
+                    alert.kind.value,
+                    alert.severity.value,
+                    alert.detail,
+                    alert.detected_at.isoformat(),
+                    int(alert.acknowledged),
+                    alert.acknowledged_at.isoformat() if alert.acknowledged_at else None,
+                    alert.acknowledged_reason,
+                ),
+            )
+
+    def get_open_alert(self, task_id: str, kind: AlertKind) -> SchedulerAlert | None:
+        """Most recent unacknowledged alert of this exact kind for this
+        task, if any — used by the detector to decide whether a new
+        scan should raise a fresh alert or leave the existing open one
+        alone, so a persisting condition never spams duplicate rows."""
+        cursor = self._conn.execute(
+            "SELECT * FROM scheduler_alerts WHERE task_id = ? AND kind = ? "
+            "AND acknowledged = 0 ORDER BY detected_at DESC LIMIT 1",
+            (task_id, kind.value),
+        )
+        row = cursor.fetchone()
+        return _row_to_scheduler_alert(row) if row is not None else None
+
+    def get_alert(self, alert_id: str) -> SchedulerAlert | None:
+        cursor = self._conn.execute(
+            "SELECT * FROM scheduler_alerts WHERE alert_id = ?", (alert_id,)
+        )
+        row = cursor.fetchone()
+        return _row_to_scheduler_alert(row) if row is not None else None
+
+    def list_alerts(
+        self, *, acknowledged: bool | None = None, task_id: str | None = None
+    ) -> list[SchedulerAlert]:
+        query = "SELECT * FROM scheduler_alerts"
+        clauses = []
+        params: list[object] = []
+        if acknowledged is not None:
+            clauses.append("acknowledged = ?")
+            params.append(int(acknowledged))
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY detected_at"
+        cursor = self._conn.execute(query, params)
+        return [_row_to_scheduler_alert(row) for row in cursor.fetchall()]
+
+    def acknowledge_alert(self, alert_id: str, now: datetime, reason: str = "") -> bool:
+        with self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE scheduler_alerts
+                SET acknowledged = 1, acknowledged_at = ?, acknowledged_reason = ?
+                WHERE alert_id = ? AND acknowledged = 0
+                """,
+                (now.isoformat(), reason, alert_id),
+            )
+        return cursor.rowcount == 1
+
 
 def _task_to_row(task: Task) -> dict[str, object]:
     return {
@@ -1059,6 +1159,22 @@ def _row_to_task_claim(row: sqlite3.Row) -> TaskClaim:
         status=ClaimStatus(row["status"]),
         claimed_at=datetime.fromisoformat(row["claimed_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+def _row_to_scheduler_alert(row: sqlite3.Row) -> SchedulerAlert:
+    return SchedulerAlert(
+        alert_id=row["alert_id"],
+        task_id=row["task_id"],
+        kind=AlertKind(row["kind"]),
+        severity=AlertSeverity(row["severity"]),
+        detail=row["detail"],
+        detected_at=datetime.fromisoformat(row["detected_at"]),
+        acknowledged=bool(row["acknowledged"]),
+        acknowledged_at=datetime.fromisoformat(row["acknowledged_at"])
+        if row["acknowledged_at"]
+        else None,
+        acknowledged_reason=row["acknowledged_reason"],
     )
 
 
