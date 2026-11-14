@@ -14,7 +14,7 @@ import json
 import sqlite3
 import threading
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from universal_orchestrator.core.models import (
@@ -39,6 +39,7 @@ from universal_orchestrator.execution.approval import (
 )
 from universal_orchestrator.execution.conflict import ConflictReport
 from universal_orchestrator.execution.quality import QualityReport, QualityVerdict
+from universal_orchestrator.execution.scheduler import ClaimStatus, SchedulerLease, TaskClaim
 from universal_orchestrator.execution.worktree import WorktreeHandle, WorktreeStatus
 
 _SCHEMA = """
@@ -199,6 +200,36 @@ CREATE TABLE IF NOT EXISTS quality_reports (
 );
 CREATE INDEX IF NOT EXISTS idx_quality_reports_task_id ON quality_reports(task_id);
 CREATE INDEX IF NOT EXISTS idx_quality_reports_level ON quality_reports(level);
+
+-- Milestone 7 (Task Scheduler, Phase 2): single-row lease, the same
+-- "one checked row, id=1" shape as `integration_lock`, plus a
+-- monotonically increasing `epoch` (the fencing token) and an
+-- explicit `expires_at` so a crashed holder's lease can be taken over
+-- without ever needing a graceful release that will never come.
+CREATE TABLE IF NOT EXISTS scheduler_lease (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    holder_id TEXT,
+    epoch INTEGER NOT NULL DEFAULT 0,
+    acquired_at TEXT,
+    renewed_at TEXT,
+    expires_at TEXT
+);
+
+-- Milestone 7: one row per task actually claimed by some Scheduler
+-- epoch. `task_id` is the primary key — exactly the same "second
+-- attempt gets IntegrityError" pattern as `worktrees` (Milestone 6.1)
+-- — so two claims for the same task_id can never both succeed,
+-- regardless of which epoch or process is attempting it.
+CREATE TABLE IF NOT EXISTS scheduler_claims (
+    task_id TEXT PRIMARY KEY,
+    epoch INTEGER NOT NULL,
+    holder_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    claimed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scheduler_claims_status ON scheduler_claims(status);
+CREATE INDEX IF NOT EXISTS idx_scheduler_claims_epoch ON scheduler_claims(epoch);
 """
 
 _COLUMNS = (
@@ -243,6 +274,15 @@ class StateManager:
         # pair that is deliberately exercised under real concurrency:
         # `acquire_integration_lock`/`release_integration_lock`.
         self._integration_lock_mutex = threading.Lock()
+        # Milestone 7: the same empirically-required Python-level lock
+        # as `_integration_lock_mutex` above, for the same reason —
+        # `check_same_thread=False` does not by itself make concurrent
+        # `execute()` calls from multiple worker threads (the
+        # Scheduler's own concurrency model) safe to interleave on one
+        # `sqlite3.Connection`. Separate from the integration-lock
+        # mutex because it guards a different resource (the scheduler
+        # lease and its claims, never `integration_lock`).
+        self._scheduler_mutex = threading.Lock()
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._initialize()
@@ -253,6 +293,10 @@ class StateManager:
             self._conn.execute(
                 "INSERT OR IGNORE INTO integration_lock (id, holder_task_id, acquired_at) "
                 "VALUES (1, NULL, NULL)"
+            )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO scheduler_lease (id, holder_id, epoch, acquired_at, "
+                "renewed_at, expires_at) VALUES (1, NULL, 0, NULL, NULL, NULL)"
             )
 
     def close(self) -> None:
@@ -675,6 +719,182 @@ class StateManager:
         row = cursor.fetchone()
         return _row_to_quality_report(row) if row is not None else None
 
+    # -- scheduler lease (Milestone 7, Phase 2) --------------------------------
+
+    def acquire_scheduler_lease(
+        self, holder_id: str, now: datetime, lease_seconds: float
+    ) -> int | None:
+        """One atomic UPDATE: succeeds only if the lease is free
+        (`holder_id IS NULL`) or the previous holder's lease has
+        expired (`expires_at < now`) — `epoch = epoch + 1` happens
+        inside that same statement, so "decide this acquisition is
+        allowed" and "advance the fencing token" can never be
+        separated by another writer. Returns the new epoch on
+        success, `None` if a live holder already owns the lease."""
+        now_iso = now.isoformat()
+        expires_iso = (now + timedelta(seconds=lease_seconds)).isoformat()
+        with self._scheduler_mutex:
+            with self._conn:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE scheduler_lease
+                    SET holder_id = ?, epoch = epoch + 1, acquired_at = ?,
+                        renewed_at = ?, expires_at = ?
+                    WHERE id = 1 AND (holder_id IS NULL OR expires_at < ?)
+                    """,
+                    (holder_id, now_iso, now_iso, expires_iso, now_iso),
+                )
+                if cursor.rowcount == 0:
+                    return None
+                row = self._conn.execute(
+                    "SELECT epoch FROM scheduler_lease WHERE id = 1"
+                ).fetchone()
+            return row["epoch"]
+
+    def renew_scheduler_lease(
+        self, holder_id: str, epoch: int, now: datetime, lease_seconds: float
+    ) -> bool:
+        """Heartbeat: extends `expires_at` without touching `epoch` —
+        never an acquisition. Fenced to the exact (`holder_id`,
+        `epoch`) the caller believes it still holds; returns `False`
+        (never raises) the moment that stops being true, so a renewal
+        attempt is itself how a holder discovers it has been
+        superseded."""
+        now_iso = now.isoformat()
+        expires_iso = (now + timedelta(seconds=lease_seconds)).isoformat()
+        with self._scheduler_mutex:
+            with self._conn:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE scheduler_lease
+                    SET renewed_at = ?, expires_at = ?
+                    WHERE id = 1 AND holder_id = ? AND epoch = ?
+                    """,
+                    (now_iso, expires_iso, holder_id, epoch),
+                )
+            return cursor.rowcount == 1
+
+    def release_scheduler_lease(self, holder_id: str, epoch: int) -> bool:
+        """Only the exact current (`holder_id`, `epoch`) may release —
+        never a bare release that could free a lease a later holder
+        now legitimately owns. `epoch` itself is left untouched (never
+        reset to 0): the next `acquire` still increments from its real
+        last value, so monotonicity holds across a clean release too."""
+        with self._scheduler_mutex:
+            with self._conn:
+                cursor = self._conn.execute(
+                    "UPDATE scheduler_lease SET holder_id = NULL "
+                    "WHERE id = 1 AND holder_id = ? AND epoch = ?",
+                    (holder_id, epoch),
+                )
+            return cursor.rowcount == 1
+
+    def current_scheduler_lease(self) -> SchedulerLease:
+        with self._scheduler_mutex:
+            row = self._conn.execute(
+                "SELECT * FROM scheduler_lease WHERE id = 1"
+            ).fetchone()
+        return _row_to_scheduler_lease(row)
+
+    # -- scheduler claims (Milestone 7, Phase 2) -------------------------------
+
+    def claim_task(self, task_id: str, holder_id: str, epoch: int, now: datetime) -> bool:
+        """Atomic INSERT...SELECT: the row is only ever inserted if
+        (`holder_id`, `epoch`) still matches the *current* lease at the
+        exact moment of the statement — one fenced check-and-write, not
+        a separate read followed by a trusting write. Returns `False`
+        (the caller must stop, never retry blindly) if the lease has
+        already moved on. Raises `errors.DuplicateError` if `task_id`
+        is already claimed by anyone, at any epoch — the actual
+        enforcement of "prevent duplicate claims," at the persistence
+        layer, not just in application logic."""
+        now_iso = now.isoformat()
+        try:
+            with self._scheduler_mutex:
+                with self._conn:
+                    cursor = self._conn.execute(
+                        """
+                        INSERT INTO scheduler_claims
+                            (task_id, epoch, holder_id, status, claimed_at, updated_at)
+                        SELECT ?, epoch, holder_id, 'claimed', ?, ?
+                        FROM scheduler_lease
+                        WHERE id = 1 AND epoch = ? AND holder_id = ?
+                        """,
+                        (task_id, now_iso, now_iso, epoch, holder_id),
+                    )
+            return cursor.rowcount == 1
+        except sqlite3.IntegrityError as exc:
+            raise DuplicateError("SchedulerClaim", task_id) from exc
+
+    def complete_claim(self, task_id: str, holder_id: str, epoch: int, now: datetime) -> bool:
+        """The genuinely atomic fenced write Requirement 2 asks for: the
+        claim's own stored `epoch` (fixed at claim time) is compared,
+        inside this one UPDATE statement, against whatever epoch is
+        *currently* authoritative — never a separately-read value
+        trusted after the fact. If a newer lease has since become
+        authoritative, this matches zero rows and returns `False`; the
+        stale holder can never again mutate this claim no matter how
+        many times it retries."""
+        now_iso = now.isoformat()
+        with self._scheduler_mutex:
+            with self._conn:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE scheduler_claims
+                    SET status = 'completed', updated_at = ?
+                    WHERE task_id = ? AND holder_id = ? AND status = 'claimed'
+                      AND epoch = (SELECT epoch FROM scheduler_lease WHERE id = 1)
+                    """,
+                    (now_iso, task_id, holder_id),
+                )
+            return cursor.rowcount == 1
+
+    def quarantine_claim(
+        self, task_id: str, holder_id: str, epoch: int, now: datetime
+    ) -> bool:
+        """Recovery/reconciliation action: the *current* authoritative
+        holder (checked the same way as `complete_claim`, but against
+        the caller's own now-current identity, not the claim's stale
+        one) marks a still-CLAIMED row left behind by an earlier epoch
+        as QUARANTINED. Never silently discarded, never silently
+        reused — see `WorktreeManager`/`TaskManager` callers, which
+        must independently decide what to do with the task/Worktree
+        itself; this call only ever updates bookkeeping."""
+        now_iso = now.isoformat()
+        with self._scheduler_mutex:
+            with self._conn:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE scheduler_claims
+                    SET status = 'quarantined', updated_at = ?
+                    WHERE task_id = ? AND status = 'claimed'
+                      AND EXISTS (
+                          SELECT 1 FROM scheduler_lease
+                          WHERE id = 1 AND holder_id = ? AND epoch = ?
+                      )
+                    """,
+                    (now_iso, task_id, holder_id, epoch),
+                )
+            return cursor.rowcount == 1
+
+    def get_claim(self, task_id: str) -> TaskClaim | None:
+        with self._scheduler_mutex:
+            row = self._conn.execute(
+                "SELECT * FROM scheduler_claims WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        return _row_to_task_claim(row) if row is not None else None
+
+    def list_claims(self, *, status: ClaimStatus | None = None) -> list[TaskClaim]:
+        query = "SELECT * FROM scheduler_claims"
+        params: list[str] = []
+        if status is not None:
+            query += " WHERE status = ?"
+            params.append(status.value)
+        query += " ORDER BY claimed_at"
+        with self._scheduler_mutex:
+            rows = self._conn.execute(query, params).fetchall()
+        return [_row_to_task_claim(row) for row in rows]
+
 
 def _task_to_row(task: Task) -> dict[str, object]:
     return {
@@ -818,6 +1038,27 @@ def _row_to_approval_decision(row: sqlite3.Row) -> ApprovalDecision:
         decision=ApprovalDecisionType(row["decision"]),
         reason=row["reason"],
         decided_at=datetime.fromisoformat(row["decided_at"]),
+    )
+
+
+def _row_to_scheduler_lease(row: sqlite3.Row) -> SchedulerLease:
+    return SchedulerLease(
+        holder_id=row["holder_id"],
+        epoch=row["epoch"],
+        acquired_at=datetime.fromisoformat(row["acquired_at"]) if row["acquired_at"] else None,
+        renewed_at=datetime.fromisoformat(row["renewed_at"]) if row["renewed_at"] else None,
+        expires_at=datetime.fromisoformat(row["expires_at"]) if row["expires_at"] else None,
+    )
+
+
+def _row_to_task_claim(row: sqlite3.Row) -> TaskClaim:
+    return TaskClaim(
+        task_id=row["task_id"],
+        epoch=row["epoch"],
+        holder_id=row["holder_id"],
+        status=ClaimStatus(row["status"]),
+        claimed_at=datetime.fromisoformat(row["claimed_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
     )
 
 
