@@ -1,0 +1,327 @@
+"""Task Scheduler — Milestone 7, Component C.
+
+Automatically dispatches every eligible READY task, bounded by a
+configurable global concurrency limit, with every execution getting
+its own isolated Worktree (M6 Option B, unchanged) — never a
+Project-wide mutex, never two executions sharing one Worktree
+(`WorktreeManager.acquire`'s own `task_id` primary key already
+guarantees that at the persistence layer, M6, unchanged).
+
+Built entirely on top of existing M1-M6 components, used exactly as
+they already exist: `OrchestrationEngine`, `GovernedPipeline`,
+`TaskManager`, `WorktreeManager`, `ApprovalGate`, `ConflictManager`,
+`QualityGate`. None of their APIs or behavior are changed here.
+Founder approval remains mandatory before integration — this module
+never calls `integrate_after_approval`; that stays the Approval CLI's
+job, strictly after a human decision.
+
+**A load-bearing, honest limitation, not a bug:** `evaluate_and_propose()`
+is called here with no `criteria_evidence` unless a caller explicitly
+supplies a `criteria_evidence_provider` (never auto-populated,
+never inferred — see Quality Gate's own docstring: "`criteria_evidence`
+must be supplied by whoever actually checked the work"). Without one, a
+task with declared `acceptance_criteria` will legitimately end FAILED
+with its Worktree NEEDS_REVIEW after automatic dispatch — Quality Gate
+returns NOT_VERIFIED, exactly as it already does for *any* caller
+supplying no evidence, unchanged since Milestone 6.4. This Scheduler
+does not bypass that, and never fabricates evidence to make a task
+appear to pass.
+
+**Fencing boundary:** `SchedulerLeaseManager` (Phase 2) owns `scheduler_
+claims`, never `tasks`/`worktrees`. A worker thread's one fenced
+write is `complete_claim()`, checked against the *live* lease epoch in
+one atomic statement, immediately before returning. If that fails (a
+takeover happened mid-dispatch), this worker's own
+`GovernedPipeline` mutations already happened and cannot be undone —
+but nothing further is attempted (`evaluate_and_propose` is skipped
+entirely if the lease was lost between `dispatch()` and that call),
+and the *new* authority's own recovery scan (`_recover()`, below)
+will find the stale CLAIMED row and quarantine both the claim and,
+if the Worktree is in a non-terminal state, the Worktree itself —
+never silently reused.
+"""
+
+from __future__ import annotations
+
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timezone
+from threading import Event, Lock
+from typing import Callable
+
+from universal_orchestrator.audit.logger import get_logger
+from universal_orchestrator.config.scheduler_settings import (
+    SchedulerSettings,
+    load_scheduler_settings,
+)
+from universal_orchestrator.core.engine import OrchestrationEngine
+from universal_orchestrator.core.governed_pipeline import GovernedPipeline
+from universal_orchestrator.core.models import RoutingOutcome, TaskStatus
+from universal_orchestrator.errors import DuplicateError, InvalidStateTransitionError, NotFoundError
+from universal_orchestrator.execution.scheduler import ClaimStatus
+from universal_orchestrator.execution.hermes_transfer import HermesWorkspaceTransfer
+from universal_orchestrator.execution.scheduler_manager import (
+    LeaseLostError,
+    SchedulerLeaseManager,
+    new_holder_id,
+)
+from universal_orchestrator.execution.worktree import WorktreeStatus
+from universal_orchestrator.registry.projects import ProjectRegistry
+
+_LOG = get_logger("scheduler")
+
+CriteriaEvidenceProvider = Callable[[str], "dict[str, bool] | None"]
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class Scheduler:
+    def __init__(
+        self,
+        state,
+        engine: OrchestrationEngine,
+        pipeline: GovernedPipeline,
+        projects: ProjectRegistry,
+        *,
+        settings: SchedulerSettings | None = None,
+        holder_id: str | None = None,
+        criteria_evidence_provider: CriteriaEvidenceProvider | None = None,
+        workspace_transfer: HermesWorkspaceTransfer | None = None,
+    ) -> None:
+        self._state = state
+        self._engine = engine
+        self._pipeline = pipeline
+        self._projects = projects
+        self._settings = settings or load_scheduler_settings()
+        self._holder_id = holder_id or new_holder_id()
+        self._evidence_provider = criteria_evidence_provider
+        self._workspace_transfer = workspace_transfer
+        self._leases = SchedulerLeaseManager(state)
+        self._epoch: int | None = None
+        self._stop_event = Event()
+        self._executor: ThreadPoolExecutor | None = None
+        self._futures: dict[str, Future] = {}
+        self._futures_lock = Lock()
+
+    @property
+    def holder_id(self) -> str:
+        return self._holder_id
+
+    @property
+    def epoch(self) -> int | None:
+        return self._epoch
+
+    # -- lifecycle -------------------------------------------------------------
+
+    def start(self) -> None:
+        """Acquire the lease (polling until free or the caller
+        stops), then run recovery/reconciliation — in that order,
+        exactly as required: normal scheduling never resumes before
+        stale claims from any superseded holder have been dealt with."""
+        self._epoch = self._acquire_with_retry()
+        self._executor = ThreadPoolExecutor(max_workers=max(1, self._settings.max_concurrency))
+        self._recover()
+
+    def _acquire_with_retry(self) -> int:
+        while not self._stop_event.is_set():
+            epoch = self._leases.try_acquire(
+                self._holder_id, lease_seconds=self._settings.lease_seconds
+            )
+            if epoch is not None:
+                _LOG.info(
+                    "scheduler lease acquired",
+                    extra={"fields": {"holder_id": self._holder_id, "epoch": epoch}},
+                )
+                return epoch
+            self._stop_event.wait(self._settings.poll_seconds)
+        raise RuntimeError("stopped before a scheduler lease could be acquired")
+
+    def _recover(self) -> None:
+        for claim in self._leases.list_claims(status=ClaimStatus.CLAIMED):
+            if claim.holder_id == self._holder_id and claim.epoch == self._epoch:
+                continue  # cannot happen right after a fresh acquire; never trust that blindly
+            if not self._leases.quarantine_claim(claim.task_id, self._holder_id, self._epoch):
+                continue
+            self._quarantine_worktree_if_ambiguous(claim.task_id)
+            _LOG.warning(
+                "quarantined a stale claim on takeover",
+                extra={"fields": {
+                    "task_id": claim.task_id, "stale_epoch": claim.epoch,
+                    "new_holder_id": self._holder_id, "new_epoch": self._epoch,
+                }},
+            )
+
+    def _quarantine_worktree_if_ambiguous(self, task_id: str) -> None:
+        try:
+            handle = self._pipeline.worktrees.get(task_id)
+        except NotFoundError:
+            return
+        if handle.status in (
+            WorktreeStatus.RELEASED, WorktreeStatus.INTEGRATED, WorktreeStatus.NEEDS_REVIEW,
+        ):
+            return  # already safe/terminal, or already flagged -- never re-flag
+        try:
+            self._pipeline.worktrees.transition(task_id, WorktreeStatus.NEEDS_REVIEW)
+        except InvalidStateTransitionError:  # pragma: no cover - defensive only
+            pass
+
+    # -- scheduling loop ---------------------------------------------------------
+
+    def run_once(self) -> list[str]:
+        """One scheduling pass: renew the lease, pick up any tasks a
+        different process submitted since the cache was last built,
+        then claim and dispatch as much eligible READY work as the
+        configured concurrency allows. Returns the task_ids dispatched
+        this pass. Raises `LeaseLostError` if renewal itself fails —
+        the caller must stop scheduling immediately, not retry."""
+        self._leases.renew(self._holder_id, self._epoch, lease_seconds=self._settings.lease_seconds)
+        self._engine.manager.sync_new_tasks()
+
+        dispatched: list[str] = []
+        for task in self._ready_tasks():
+            if self._active_count() >= self._settings.max_concurrency:
+                break
+            if not self._claim(task.task_id):
+                continue
+            self._submit_worker(task.task_id)
+            dispatched.append(task.task_id)
+        return dispatched
+
+    def run_forever(self) -> None:
+        self.start()
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    self.run_once()
+                except LeaseLostError:
+                    _LOG.error("scheduler lease lost during the scheduling loop -- stopping")
+                    break
+                self._stop_event.wait(self._settings.poll_seconds)
+        finally:
+            self.shutdown()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def shutdown(self) -> None:
+        """Stop accepting new work, wait up to `drain_timeout_seconds`
+        for in-flight workers, and release the lease *only if* every
+        one of them actually finished. Never force-kills a worker
+        thread or the Agent subprocess underneath it — neither
+        adapter's lifecycle supports that safely — and never releases
+        while completion is unconfirmed: a straggler left running
+        keeps the lease it still (genuinely) holds, so a future
+        takeover's own recovery scan is what eventually quarantines
+        it, never a premature reuse of its Worktree."""
+        self._stop_event.set()
+        if self._executor is None:
+            return
+
+        deadline = time.monotonic() + self._settings.drain_timeout_seconds
+        while time.monotonic() < deadline and self._active_count() > 0:
+            time.sleep(0.05)
+
+        still_active = self._active_count()
+        self._executor.shutdown(wait=False)
+
+        if still_active > 0:
+            _LOG.warning(
+                "shutdown: worker(s) still active after drain_timeout_seconds -- "
+                "NOT releasing the lease; it will expire naturally",
+                extra={"fields": {"still_active": still_active, "holder_id": self._holder_id}},
+            )
+            return
+
+        released = self._leases.release(self._holder_id, self._epoch)
+        _LOG.info(
+            "scheduler shutdown complete",
+            extra={"fields": {"holder_id": self._holder_id, "lease_released": released}},
+        )
+
+    # -- internals -----------------------------------------------------------
+
+    def _ready_tasks(self):
+        claimed = {c.task_id for c in self._leases.list_claims(status=ClaimStatus.CLAIMED)}
+        return [
+            t for t in self._engine.manager.all_tasks()
+            if t.status is TaskStatus.READY and t.task_id not in claimed
+        ]
+
+    def _active_count(self) -> int:
+        with self._futures_lock:
+            return len(self._futures)
+
+    def _claim(self, task_id: str) -> bool:
+        try:
+            return self._leases.claim_task(task_id, self._holder_id, self._epoch)
+        except DuplicateError:
+            return False
+
+    def _submit_worker(self, task_id: str) -> None:
+        future = self._executor.submit(self._run_task, task_id)
+        with self._futures_lock:
+            self._futures[task_id] = future
+        future.add_done_callback(lambda _f, tid=task_id: self._on_worker_done(tid))
+
+    def _on_worker_done(self, task_id: str) -> None:
+        with self._futures_lock:
+            self._futures.pop(task_id, None)
+
+    def _run_task(self, task_id: str) -> None:
+        task = self._engine.manager.get(task_id)
+        try:
+            project = self._projects.get(task.project_id)
+        except NotFoundError:
+            _LOG.error(
+                "no ProjectProfile registered for project; cannot dispatch",
+                extra={"fields": {"task_id": task_id, "project_id": task.project_id}},
+            )
+            self._finish_claim(task_id)
+            return
+
+        try:
+            self._ensure_routed(task_id, project)
+            self._pipeline.dispatch(task_id, project, workspace_transfer=self._workspace_transfer)
+        except Exception:
+            _LOG.exception("dispatch failed", extra={"fields": {"task_id": task_id}})
+            self._finish_claim(task_id)
+            return
+
+        if not self._still_authoritative():
+            _LOG.warning(
+                "scheduler lease lost mid-dispatch -- not calling evaluate_and_propose; "
+                "the new authority's recovery scan will quarantine this claim",
+                extra={"fields": {"task_id": task_id}},
+            )
+            return  # deliberately skips _finish_claim: this epoch is no longer authoritative
+
+        try:
+            evidence = self._evidence_provider(task_id) if self._evidence_provider else None
+            self._pipeline.evaluate_and_propose(task_id, project, criteria_evidence=evidence)
+        except Exception:
+            _LOG.exception("evaluate_and_propose failed", extra={"fields": {"task_id": task_id}})
+
+        self._finish_claim(task_id)
+
+    def _ensure_routed(self, task_id: str, project) -> None:
+        decisions = self._engine.manager.get_routing_decisions(task_id)
+        if decisions and decisions[-1].outcome is RoutingOutcome.SELECTED:
+            return
+        task = self._engine.manager.get(task_id)
+        task.payload.setdefault("required_role", "coder")
+        self._engine.route(task_id, project)
+
+    def _still_authoritative(self) -> bool:
+        current = self._leases.current()
+        return current.holder_id == self._holder_id and current.epoch == self._epoch
+
+    def _finish_claim(self, task_id: str) -> None:
+        ok = self._leases.complete_claim(task_id, self._holder_id, self._epoch)
+        if not ok:
+            _LOG.warning(
+                "stale completion write rejected -- lease was lost before this claim "
+                "could complete",
+                extra={"fields": {"task_id": task_id}},
+            )

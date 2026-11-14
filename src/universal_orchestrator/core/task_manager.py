@@ -75,6 +75,23 @@ class TaskManager:
     def list_children(self, parent_id: str) -> list[Task]:
         return [t for t in self._tasks.values() if t.parent_id == parent_id]
 
+    def sync_new_tasks(self) -> list[str]:
+        """Milestone 7 (Task Scheduler): picks up tasks created by a
+        *different* process since this cache was last built. Never
+        touches a task already known to this cache — unlike
+        `recover()`, which is only ever safe to call once, at
+        bootstrap, this is safe to call repeatedly from a live
+        scheduling loop precisely because it never re-reads, never
+        overwrites, and never flags anything INTERRUPTED; it only
+        ever adds entries this process has not seen before. Returns
+        the newly-discovered task_ids."""
+        discovered: list[str] = []
+        for task in self._state.list():
+            if task.task_id not in self._tasks:
+                self._tasks[task.task_id] = task
+                discovered.append(task.task_id)
+        return discovered
+
     def all_tasks(self) -> list[Task]:
         """Every task currently in the in-memory cache — the same
         structure `detect_cycles`/`diagnose_blocked` and Milestone 7's
